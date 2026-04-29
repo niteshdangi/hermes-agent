@@ -447,8 +447,11 @@ def _prepare_local_audio(file_path: str, work_dir: str) -> tuple[Optional[str], 
     command = [ffmpeg, "-y", "-i", file_path, converted_path]
 
     try:
-        subprocess.run(command, check=True, capture_output=True, text=True)
+        subprocess.run(command, check=True, capture_output=True, text=True, timeout=600)
         return converted_path, None
+    except subprocess.TimeoutExpired:
+        logger.error("ffmpeg conversion timed out (>600s) for %s", file_path)
+        return None, "ffmpeg conversion timed out after 600s"
     except subprocess.CalledProcessError as e:
         details = e.stderr.strip() or e.stdout.strip() or str(e)
         logger.error("ffmpeg conversion failed for %s: %s", file_path, details)
@@ -487,7 +490,7 @@ def _transcribe_local_command(file_path: str, model_name: str) -> Dict[str, Any]
                 language=shlex.quote(language),
                 model=shlex.quote(normalized_model),
             )
-            subprocess.run(command, shell=True, check=True, capture_output=True, text=True)
+            subprocess.run(command, shell=True, check=True, capture_output=True, text=True, timeout=1800)
 
             txt_files = sorted(Path(output_dir).glob("*.txt"))
             if not txt_files:
@@ -512,6 +515,9 @@ def _transcribe_local_command(file_path: str, model_name: str) -> Dict[str, Any]
             "transcript": "",
             "error": f"Invalid {LOCAL_STT_COMMAND_ENV} template, missing placeholder: {e}",
         }
+    except subprocess.TimeoutExpired:
+        logger.error("Local STT command timed out (>1800s) for %s", file_path)
+        return {"success": False, "transcript": "", "error": "Local STT command timed out after 1800s"}
     except subprocess.CalledProcessError as e:
         details = e.stderr.strip() or e.stdout.strip() or str(e)
         logger.error("Local STT command failed for %s: %s", file_path, details)

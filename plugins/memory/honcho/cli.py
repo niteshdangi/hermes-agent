@@ -339,11 +339,16 @@ def _ensure_sdk_installed() -> bool:
 
     import subprocess
     print("  Installing honcho-ai...", flush=True)
-    result = subprocess.run(
-        [sys.executable, "-m", "pip", "install", "honcho-ai>=2.0.1"],
-        capture_output=True,
-        text=True,
-    )
+    try:
+        result = subprocess.run(
+            [sys.executable, "-m", "pip", "install", "honcho-ai>=2.0.1"],
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+    except subprocess.TimeoutExpired:
+        print("  pip install honcho-ai timed out after 300s — install manually.\n")
+        return False
     if result.returncode == 0:
         print("  Installed.\n")
         return True
