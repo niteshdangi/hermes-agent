@@ -58,15 +58,6 @@ _FORCE_FORWARD_SUBSTRINGS = (
     "please confirm",
     "please provide",
     "could you ",
-    # Spawn-task watchdog signals — these are ALWAYS user-relevant. Atlas
-    # subagent finished (success/fail/killed) and Nitesh wants to know.
-    "[spawn_task ",
-    "spawn_task ",
-    "watchdog:",
-    "heartbeat stale",
-    " killed.",
-    " failed.",
-    " completed.",
 )
 
 
