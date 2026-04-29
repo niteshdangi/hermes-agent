@@ -31,6 +31,59 @@ TRIAGE_MAX_ITERATIONS = 15
 ARCHIVE_ROOT = Path.home() / ".atlas" / "cron_archive"
 
 
+# Deterministic "must forward" signals. If a cron output contains any of these
+# patterns, the triage turn is NOT allowed to silence it — even if the LLM
+# returns [SILENT], we override to forward the raw cron output. This is the
+# safety net for the rubric in the skill / system prompt.
+_FORCE_FORWARD_SUBSTRINGS = (
+    "❌",
+    "🚨",
+    "stuck",
+    "blocked",
+    "blocker",
+    "awaiting",
+    "needs from you",
+    "need from you",
+    "needs your input",
+    "need your input",
+    "waiting on",
+    "cannot proceed",
+    "can't proceed",
+    "can not proceed",
+    "stop and report",
+    "requires user",
+    "user input required",
+    "user action required",
+    "manual intervention",
+    "please confirm",
+    "please provide",
+    "could you ",
+)
+
+
+def should_force_forward(cron_output: str) -> bool:
+    """Deterministic check: does this cron output explicitly require forwarding?
+
+    Returns True if the cron output contains explicit user-blocking signals
+    (errors, stuck states, user input requests, end-of-bullet questions).
+    The triage agent's [SILENT] decision is overridden when this returns True.
+    """
+    if not cron_output:
+        return False
+    text = cron_output.lower()
+    for needle in _FORCE_FORWARD_SUBSTRINGS:
+        if needle in text:
+            return True
+    # Question marks at end of a bullet/line are strong "asking the user" signals.
+    for line in cron_output.splitlines():
+        s = line.strip()
+        if not s:
+            continue
+        if s.endswith("?") and (s.startswith(("-", "*", "•")) or s[:3].rstrip(".").isdigit()):
+            return True
+    return False
+
+
 def is_triage_target(deliver_value: str) -> bool:
     """Return True iff *deliver_value* requests Atlas triage."""
     if not deliver_value:
@@ -123,7 +176,23 @@ def run_triage_turn(job: dict, cron_output: str, *, status: str = "ok") -> str:
         "Your final response WILL be delivered to Nitesh via the normal cron "
         "delivery path — respond with `[SILENT]` (and nothing else) to stay "
         "quiet, or produce the curated message you want him to see on Telegram. "
-        "Hard cap: 15 tool calls. Never trigger another cron from this turn."
+        "Hard cap: 15 tool calls. Never trigger another cron from this turn.\n\n"
+        "HARD MUST-FORWARD RULES (never [SILENT] if any apply):\n"
+        "1. Cron output contains ❌, 🚨, 'stuck', 'blocked', 'awaiting', "
+        "'needs from you', 'needs your input', 'waiting on', 'cannot proceed', "
+        "'STOP and report', or any explicit user-blocking phrasing.\n"
+        "2. Cron output asks Nitesh a direct question (bullet ending in '?', "
+        "'please confirm', 'please provide', 'could you...').\n"
+        "3. Spawn/cron task completed but exposes a NEW open decision Atlas "
+        "needs Nitesh to resolve.\n"
+        "4. Any failed/error status — last_status != 'ok' or output reports "
+        "a failure.\n"
+        "When any rule applies: forward the result verbatim or with minimal "
+        "Atlas framing (≤2-line lead-in + the original blocker text). Do NOT "
+        "compress away the specific asks (vault entries, tokens, confirmations). "
+        "[SILENT] remains correct ONLY for true noise (heartbeat ticks, "
+        "self-test ok, daily brief on a quiet day) — the archive keeps the "
+        "trail for those."
     )
 
     # Inject the skill content directly so it's loaded even if skills_tool isn't enabled.
@@ -168,6 +237,18 @@ def run_triage_turn(job: dict, cron_output: str, *, status: str = "ok") -> str:
         if not response:
             logger.warning("cron-triage: empty response for job %s — forwarding raw", job_id)
             return cron_output
+        # Safety net: if the cron output explicitly signals a blocker / user
+        # input request / failure, override [SILENT] and forward the raw output.
+        # This catches LLM rubric drift — see should_force_forward().
+        if response.strip() == SILENT_MARKER and should_force_forward(cron_output):
+            logger.warning(
+                "cron-triage: overriding [SILENT] for job %s — must-forward signal detected",
+                job_id,
+            )
+            return (
+                "⚠️ Cron triage flagged this as needing your attention "
+                "(blocker / user-input request detected):\n\n" + cron_output
+            )
         return response
     except Exception as e:
         logger.exception("cron-triage: triage turn failed for job %s: %s", job_id, e)
