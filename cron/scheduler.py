@@ -117,9 +117,59 @@ SILENT_MARKER = "[SILENT]"
 # Resolve Hermes home directory (respects HERMES_HOME override)
 _hermes_home = get_hermes_home()
 
-# File-based lock prevents concurrent ticks from gateway + daemon + systemd timer
+# File-based locks. The TICK lock is a brief mutex that only guards the
+# "scan + claim" critical section (read due jobs, advance next_run_at,
+# acquire per-job locks). It is held for milliseconds.
+#
+# The PER-JOB locks (one file per job_id under .locks/) prevent the same
+# job from double-firing across overlapping ticks, while letting
+# independent jobs run concurrently. This replaces the old behavior where
+# the tick lock was held for the entire batch duration, starving subsequent
+# ticks while any long-running cron was alive.
 _LOCK_DIR = _hermes_home / "cron"
 _LOCK_FILE = _LOCK_DIR / ".tick.lock"
+_JOB_LOCK_DIR = _LOCK_DIR / ".locks"
+
+
+def _acquire_job_lock(job_id: str):
+    """Try to acquire an exclusive non-blocking lock for a single job.
+
+    Returns the open file descriptor on success (caller must close to
+    release), or None if the job is already running elsewhere.
+    """
+    _JOB_LOCK_DIR.mkdir(parents=True, exist_ok=True)
+    lock_path = _JOB_LOCK_DIR / f"{job_id}.lock"
+    try:
+        fd = open(lock_path, "w")
+        if fcntl:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        elif msvcrt:
+            msvcrt.locking(fd.fileno(), msvcrt.LK_NBLCK, 1)
+        return fd
+    except (OSError, IOError):
+        try:
+            fd.close()
+        except Exception:
+            pass
+        return None
+
+
+def _release_job_lock(fd) -> None:
+    if fd is None:
+        return
+    try:
+        if fcntl:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        elif msvcrt:
+            try:
+                msvcrt.locking(fd.fileno(), msvcrt.LK_UNLCK, 1)
+            except (OSError, IOError):
+                pass
+    finally:
+        try:
+            fd.close()
+        except Exception:
+            pass
 
 
 def _resolve_origin(job: dict) -> Optional[dict]:
@@ -1221,21 +1271,28 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
         Number of jobs executed (0 if another tick is already running)
     """
     _LOCK_DIR.mkdir(parents=True, exist_ok=True)
+    _JOB_LOCK_DIR.mkdir(parents=True, exist_ok=True)
 
-    # Cross-platform file locking: fcntl on Unix, msvcrt on Windows
-    lock_fd = None
+    # ── CLAIM PHASE (brief tick lock) ────────────────────────────────────
+    # Hold the global tick lock ONLY long enough to scan due jobs, advance
+    # next_run_at, and acquire a per-job lock for each one. This prevents
+    # two overlapping ticks from both deciding the same job is due, but
+    # releases the global mutex in milliseconds so subsequent ticks aren't
+    # starved by long-running jobs.
+    claim_lock_fd = None
     try:
-        lock_fd = open(_LOCK_FILE, "w")
+        claim_lock_fd = open(_LOCK_FILE, "w")
         if fcntl:
-            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(claim_lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         elif msvcrt:
-            msvcrt.locking(lock_fd.fileno(), msvcrt.LK_NBLCK, 1)
+            msvcrt.locking(claim_lock_fd.fileno(), msvcrt.LK_NBLCK, 1)
     except (OSError, IOError):
-        logger.debug("Tick skipped — another instance holds the lock")
-        if lock_fd is not None:
-            lock_fd.close()
+        logger.debug("Tick claim skipped — another tick is currently claiming jobs")
+        if claim_lock_fd is not None:
+            claim_lock_fd.close()
         return 0
 
+    claimed: list[tuple[dict, object]] = []  # (job, job_lock_fd)
     try:
         due_jobs = get_due_jobs()
 
@@ -1246,10 +1303,43 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
         if verbose:
             logger.info("%s - %s job(s) due", _hermes_now().strftime('%H:%M:%S'), len(due_jobs))
 
-        # Advance next_run_at for all recurring jobs FIRST, under the file lock,
-        # before any execution begins.  This preserves at-most-once semantics.
+        # Try to acquire a per-job lock for each due job. Jobs already held
+        # by another tick (still running) are skipped — their next-run was
+        # already advanced when they were originally claimed.
         for job in due_jobs:
-            advance_next_run(job["id"])
+            job_id = job["id"]
+            job_fd = _acquire_job_lock(job_id)
+            if job_fd is None:
+                logger.info(
+                    "Job '%s' is already running in another tick — skipping",
+                    job_id,
+                )
+                continue
+            # Advance next_run_at AFTER claiming so a job that's still running
+            # from a prior tick doesn't have its schedule double-advanced.
+            advance_next_run(job_id)
+            claimed.append((job, job_fd))
+    finally:
+        # Release the global tick lock immediately — execution proceeds
+        # outside it, guarded only by per-job locks.
+        try:
+            if fcntl:
+                fcntl.flock(claim_lock_fd, fcntl.LOCK_UN)
+            elif msvcrt:
+                try:
+                    msvcrt.locking(claim_lock_fd.fileno(), msvcrt.LK_UNLCK, 1)
+                except (OSError, IOError):
+                    pass
+        finally:
+            claim_lock_fd.close()
+
+    if not claimed:
+        return 0
+
+    due_jobs = [job for (job, _fd) in claimed]
+    job_lock_by_id = {job["id"]: fd for (job, fd) in claimed}
+
+    try:
 
         # Resolve max parallel workers: env var > config.yaml > unbounded.
         # Set HERMES_CRON_MAX_PARALLEL=1 to restore old serial behaviour.
@@ -1352,6 +1442,9 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
                 logger.error("Error processing job %s: %s", job['id'], e)
                 mark_job_run(job["id"], False, str(e))
                 return False
+            finally:
+                # Release this job's per-job lock as soon as it finishes.
+                _release_job_lock(job_lock_by_id.pop(job["id"], None))
 
         # Partition due jobs: those with a per-job workdir mutate
         # os.environ["TERMINAL_CWD"] inside run_job, which is process-global —
@@ -1389,14 +1482,12 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
 
         return sum(_results)
     finally:
-        if fcntl:
-            fcntl.flock(lock_fd, fcntl.LOCK_UN)
-        elif msvcrt:
-            try:
-                msvcrt.locking(lock_fd.fileno(), msvcrt.LK_UNLCK, 1)
-            except (OSError, IOError):
-                pass
-        lock_fd.close()
+        # Safety net: release any per-job locks still held (e.g. if an
+        # exception bypassed _process_job's finally). Normal completion
+        # already released them as each job finished.
+        for _fd in list(job_lock_by_id.values()):
+            _release_job_lock(_fd)
+        job_lock_by_id.clear()
 
 
 if __name__ == "__main__":
