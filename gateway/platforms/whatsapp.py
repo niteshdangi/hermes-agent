@@ -164,6 +164,18 @@ class WhatsAppAdapter(BasePlatformAdapter):
 
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform.WHATSAPP)
+        # Backend selection: "default" = managed whatsapp-web.js bridge,
+        # "baileys" = external Baileys bridge (e.g. ~/.atlas/whatsapp) with
+        # an inbound webhook receiver started by this adapter.
+        self._backend: str = str(config.extra.get("backend") or "default").lower()
+        self._baileys_url: str = str(config.extra.get("baileys_url") or "http://127.0.0.1:8782").rstrip("/")
+        self._inbound_port: int = int(config.extra.get("inbound_port") or 8788)
+        self._inbound_path: str = str(config.extra.get("inbound_path") or "/whatsapp/inbound")
+        self._inbound_runner = None  # aiohttp AppRunner
+        self._inbound_site = None
+        self._allowed_users_baileys = self._coerce_allow_list(
+            config.extra.get("allowed_users") or config.extra.get("allow_from")
+        )
         self._bridge_process: Optional[subprocess.Popen] = None
         self._bridge_port: int = config.extra.get("bridge_port", 3000)
         self._bridge_script: Optional[str] = config.extra.get(
@@ -353,6 +365,8 @@ class WhatsAppAdapter(BasePlatformAdapter):
         
         This launches the Node.js bridge process and waits for it to be ready.
         """
+        if self._backend == "baileys":
+            return await self._connect_baileys()
         if not check_whatsapp_requirements():
             logger.warning("[%s] Node.js not found. WhatsApp requires Node.js.", self.name)
             return False
@@ -537,6 +551,174 @@ class WhatsAppAdapter(BasePlatformAdapter):
                     self._release_platform_lock()
                 self._close_bridge_log()
     
+    # ── Baileys backend (external bridge + inbound webhook) ─────────────
+
+    @staticmethod
+    def _redact_phone(num: str) -> str:
+        s = str(num or "")
+        if len(s) <= 4:
+            return "***"
+        return f"{s[:2]}***{s[-2:]}"
+
+    async def _connect_baileys(self) -> bool:
+        """Connect using the external Baileys bridge.
+
+        Verifies the bridge /health endpoint is reachable and starts an
+        aiohttp inbound webhook on 127.0.0.1:<inbound_port>. Does NOT
+        manage the Baileys process — it is owned by systemd.
+        """
+        import aiohttp
+        from aiohttp import web
+
+        # Verify Baileys /health
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    f"{self._baileys_url}/health",
+                    timeout=aiohttp.ClientTimeout(total=3),
+                ) as resp:
+                    if resp.status != 200:
+                        logger.warning("[%s] Baileys /health returned %s", self.name, resp.status)
+                    else:
+                        try:
+                            data = await resp.json()
+                            logger.info("[%s] Baileys bridge state=%s", self.name, data.get("state"))
+                        except Exception:
+                            pass
+        except Exception as e:
+            logger.warning("[%s] Baileys bridge unreachable at %s: %s", self.name, self._baileys_url, e)
+            # Don't hard-fail — bridge may come up later.
+
+        # Persistent HTTP session for outbound /send
+        self._http_session = aiohttp.ClientSession()
+
+        # Start inbound webhook server.
+        app = web.Application()
+        app.router.add_post(self._inbound_path, self._handle_baileys_inbound)
+        app.router.add_get("/health", lambda r: web.json_response({"ok": True, "platform": "whatsapp"}))
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, "127.0.0.1", self._inbound_port)
+        try:
+            await site.start()
+        except OSError as e:
+            logger.error("[%s] Could not bind inbound webhook on 127.0.0.1:%d: %s",
+                         self.name, self._inbound_port, e)
+            try:
+                await runner.cleanup()
+            except Exception:
+                pass
+            if self._http_session:
+                await self._http_session.close()
+                self._http_session = None
+            return False
+
+        self._inbound_runner = runner
+        self._inbound_site = site
+        self._mark_connected()
+        logger.info(
+            "[%s] Baileys backend ready: out=%s inbound=http://127.0.0.1:%d%s",
+            self.name, self._baileys_url, self._inbound_port, self._inbound_path,
+        )
+        return True
+
+    async def _handle_baileys_inbound(self, request):
+        """aiohttp handler — receive POSTs from the Baileys bridge."""
+        from aiohttp import web
+        try:
+            data = await request.json()
+        except Exception:
+            return web.json_response({"ok": False, "error": "invalid json"}, status=400)
+
+        sender = str(data.get("from") or "").replace("+", "").strip()
+        if not sender:
+            return web.json_response({"ok": False, "error": "missing from"}, status=400)
+
+        # Strict whitelist
+        if self._allowed_users_baileys and sender not in self._allowed_users_baileys:
+            logger.warning("[%s] inbound REJECT non-whitelisted from=%s",
+                           self.name, self._redact_phone(sender))
+            return web.json_response({"ok": False, "error": "forbidden"}, status=403)
+
+        text = str(data.get("text") or "")
+        msg_id = str(data.get("msg_id") or "")
+        logger.info("[%s] inbound from=%s msg_id=%s len=%d",
+                    self.name, self._redact_phone(sender), msg_id, len(text))
+
+        try:
+            source = self.build_source(
+                chat_id=sender,
+                chat_name="Nitesh Kumar" if sender == "917027026665" else None,
+                chat_type="dm",
+                user_id=sender,
+                user_name="Nitesh Kumar" if sender == "917027026665" else None,
+                message_id=msg_id or None,
+            )
+            event = MessageEvent(
+                text=text,
+                message_type=MessageType.TEXT,
+                source=source,
+                raw_message=data,
+                message_id=msg_id or None,
+                media_urls=[],
+                media_types=[],
+            )
+            # Dispatch async; respond to bridge immediately.
+            asyncio.create_task(self.handle_message(event))
+        except Exception as e:
+            logger.exception("[%s] failed to dispatch inbound: %s", self.name, e)
+            return web.json_response({"ok": False, "error": "dispatch failed"}, status=500)
+
+        return web.json_response({"ok": True})
+
+    async def _send_via_baileys(self, chat_id: str, text: str) -> SendResult:
+        """POST to Baileys /send. chat_id = bare phone or full JID."""
+        if not self._http_session:
+            return SendResult(success=False, error="Not connected")
+        import aiohttp
+        try:
+            async with self._http_session.post(
+                f"{self._baileys_url}/send",
+                json={"to": chat_id, "text": text},
+                timeout=aiohttp.ClientTimeout(total=30),
+            ) as resp:
+                body = await resp.text()
+                if resp.status == 200:
+                    try:
+                        data = json.loads(body)
+                    except Exception:
+                        data = {}
+                    return SendResult(success=True, message_id=data.get("id"), raw_response=data)
+                logger.warning(
+                    "[%s] Baileys /send -> %s for chat=%s body=%s",
+                    self.name, resp.status, self._redact_phone(chat_id), body[:200],
+                )
+                return SendResult(success=False, error=f"baileys {resp.status}: {body[:200]}")
+        except Exception as e:
+            return SendResult(success=False, error=str(e))
+
+    async def _disconnect_baileys(self) -> None:
+        if self._inbound_site is not None:
+            try:
+                await self._inbound_site.stop()
+            except Exception:
+                pass
+            self._inbound_site = None
+        if self._inbound_runner is not None:
+            try:
+                await self._inbound_runner.cleanup()
+            except Exception:
+                pass
+            self._inbound_runner = None
+        if self._http_session and not self._http_session.closed:
+            try:
+                await self._http_session.close()
+            except Exception:
+                pass
+        self._http_session = None
+        self._mark_disconnected()
+        logger.info("[%s] Baileys backend disconnected", self.name)
+
     def _close_bridge_log(self) -> None:
         """Close the bridge log file handle if open."""
         if self._bridge_log_fh:
@@ -565,6 +747,9 @@ class WhatsAppAdapter(BasePlatformAdapter):
 
     async def disconnect(self) -> None:
         """Stop the WhatsApp bridge and clean up any orphaned processes."""
+        if self._backend == "baileys":
+            await self._disconnect_baileys()
+            return
         if self._bridge_process:
             try:
                 try:
@@ -675,6 +860,20 @@ class WhatsAppAdapter(BasePlatformAdapter):
         """
         if not self._running or not self._http_session:
             return SendResult(success=False, error="Not connected")
+        if self._backend == "baileys":
+            formatted = self.format_message(content) if content else content
+            chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH) if formatted else [""]
+            last_id = None
+            for chunk in chunks:
+                if not chunk:
+                    continue
+                r = await self._send_via_baileys(chat_id, chunk)
+                if not r.success:
+                    return r
+                last_id = r.message_id
+                if len(chunks) > 1:
+                    await asyncio.sleep(0.3)
+            return SendResult(success=True, message_id=last_id)
         bridge_exit = await self._check_managed_bridge_exit()
         if bridge_exit:
             return SendResult(success=False, error=bridge_exit)
@@ -764,6 +963,8 @@ class WhatsAppAdapter(BasePlatformAdapter):
         file_name: Optional[str] = None,
     ) -> SendResult:
         """Send any media file via bridge /send-media endpoint."""
+        if self._backend == "baileys":
+            return SendResult(success=False, error="Media not supported on Baileys backend yet")
         if not self._running or not self._http_session:
             return SendResult(success=False, error="Not connected")
         bridge_exit = await self._check_managed_bridge_exit()
@@ -868,6 +1069,9 @@ class WhatsAppAdapter(BasePlatformAdapter):
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
         """Send typing indicator via bridge."""
+        if self._backend == "baileys":
+            # Baileys bridge does not expose presence; no-op.
+            return
         if not self._running or not self._http_session:
             return
         if await self._check_managed_bridge_exit():
@@ -886,6 +1090,9 @@ class WhatsAppAdapter(BasePlatformAdapter):
     
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         """Get information about a WhatsApp chat."""
+        if self._backend == "baileys":
+            name = "Nitesh Kumar" if str(chat_id).replace("+", "") == "917027026665" else str(chat_id)
+            return {"name": name, "type": "dm", "chat_id": chat_id}
         if not self._running or not self._http_session:
             return {"name": "Unknown", "type": "dm"}
         if await self._check_managed_bridge_exit():
