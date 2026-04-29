@@ -170,6 +170,8 @@ HARDLINE_PATTERNS = [
     # is the safe path and is NOT matched. Hardline (no yolo bypass).
     (_CMDPOS + r'gh\s+auth\s+switch\b', "gh auth switch (breaks Copilot subscription — use 'gh -u <account> ...' for per-command identity)"),
     (_CMDPOS + r'gh\s+auth\s+set-default\b', "gh auth set-default (flips Copilot-bearing active account — use 'gh -u <account> ...' for per-command identity)"),
+    (_CMDPOS + r'gh\s+auth\s+login\b', "gh auth login (can replace active Copilot-bearing account — niteshdangi must remain active; use 'gh -u <account> ...' instead)"),
+    (_CMDPOS + r'gh\s+auth\s+logout\b', "gh auth logout (logging out niteshdangi destroys Copilot access; explicit confirmation required)"),
 ]
 
 # Pre-compiled variant used by the hot-path matcher. Building these at module
