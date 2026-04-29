@@ -439,6 +439,44 @@ def _prompt_for_sudo_password(timeout_seconds: int = 45) -> str:
         if "HERMES_SPINNER_PAUSE" in os.environ:
             del os.environ["HERMES_SPINNER_PAUSE"]
 
+# Module-level guard so the "phantom cwd reset" log fires once per (env, path)
+# rather than once per command — avoids spamming agent.log when a deleted cwd
+# persists across many tool calls.
+_phantom_cwd_logged: set[tuple[int, str]] = set()
+
+
+def _reset_env_cwd_if_missing(env: Any) -> None:
+    """Reset a persistent-shell environment's cwd to $HOME if it no longer exists.
+
+    Background: the persistent shell session caches its working directory across
+    commands. If that directory is removed out-of-band (e.g. ``rm -rf`` of a
+    tmp dir), every subsequent ``subprocess.Popen(cwd=...)`` raises
+    ``FileNotFoundError`` and burns through the 3-attempt retry loop before
+    failing the call. Detect that case here and silently rebase to $HOME so the
+    next command runs cleanly.
+
+    Fail-open: any unexpected error here must not block command execution.
+    """
+    try:
+        cwd = getattr(env, "cwd", None)
+        if not cwd or not isinstance(cwd, str):
+            return
+        if os.path.isdir(cwd):
+            return
+        home = os.path.expanduser("~") or "/"
+        key = (id(env), cwd)
+        if key not in _phantom_cwd_logged:
+            _phantom_cwd_logged.add(key)
+            logger.warning(
+                "terminal_tool: persistent-shell cwd %r no longer exists; "
+                "resetting to %r before next command.",
+                cwd, home,
+            )
+        env.cwd = home
+    except Exception as exc:  # pragma: no cover — defensive
+        logger.debug("phantom-cwd reset skipped: %s", exc)
+
+
 def _safe_command_preview(command: Any, limit: int = 200) -> str:
     """Return a log-safe preview for possibly-invalid command values."""
     if command is None:
@@ -1864,6 +1902,12 @@ def terminal_tool(
                     "error": f"Failed to start background process: {str(e)}"
                 }, ensure_ascii=False)
         else:
+            # Phantom-CWD guard: if the persistent shell session's cwd has been
+            # removed out from under us (e.g. user rmdir'd /tmp/tirith-test),
+            # reset to $HOME *before* dispatching the command. Otherwise every
+            # subsequent invocation FileNotFoundErrors 3x through retry logic.
+            _reset_env_cwd_if_missing(env)
+
             # Run foreground command with retry logic
             max_retries = 3
             retry_count = 0
