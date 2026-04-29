@@ -1,0 +1,3 @@
+name: multiplex
+version: 0.1.0
+description: "Multiplexer — fans out to multiple child memory providers (mem0 + honcho), bypassing the single-active-provider limit."
