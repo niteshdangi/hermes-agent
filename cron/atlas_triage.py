@@ -76,24 +76,6 @@ def archive_cron_output(job: dict, content: str, *, status: str = "ok") -> Optio
             f"---\n\n"
         )
         path.write_text(header + (content or ""), encoding="utf-8")
-        # Also leave a vault breadcrumb under today's daily so every cron
-        # landing has a durable trail even if Atlas triage stays silent.
-        try:
-            import sys as _sys
-            _atlas_root = "/home/atlas/.atlas"
-            if _atlas_root not in _sys.path:
-                _sys.path.insert(0, _atlas_root)
-            from vault_writer import log_cron_landing  # type: ignore
-            summary = (content or "").strip().splitlines()
-            first = summary[0] if summary else ""
-            log_cron_landing(
-                job_name=str(job.get("name") or job.get("id") or "unknown"),
-                job_id=str(job.get("id") or "unknown"),
-                status=status,
-                summary=first,
-            )
-        except Exception as _vault_exc:
-            logger.debug("cron-triage: vault breadcrumb skipped: %s", _vault_exc)
         return path
     except Exception as e:
         logger.warning("cron-triage: archive write failed for job %s: %s", job.get("id"), e)
