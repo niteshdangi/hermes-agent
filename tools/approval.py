@@ -162,6 +162,14 @@ HARDLINE_PATTERNS = [
     (_CMDPOS + r'init\s+[06]\b', "init 0/6 (shutdown/reboot)"),
     (_CMDPOS + r'systemctl\s+(poweroff|reboot|halt|kexec)\b', "systemctl poweroff/reboot"),
     (_CMDPOS + r'telinit\s+[06]\b', "telinit 0/6 (shutdown/reboot)"),
+    # Atlas-specific: `gh auth switch` and `gh auth set-default` flip the
+    # active gh account. The active account `niteshdangi` carries the
+    # Copilot subscription; switching to `shdan-in` produces silent
+    # 400 model_not_supported and breaks the agent's model access. This
+    # has bitten Atlas twice. Per-command identity via `gh -u <account>`
+    # is the safe path and is NOT matched. Hardline (no yolo bypass).
+    (_CMDPOS + r'gh\s+auth\s+switch\b', "gh auth switch (breaks Copilot subscription — use 'gh -u <account> ...' for per-command identity)"),
+    (_CMDPOS + r'gh\s+auth\s+set-default\b', "gh auth set-default (flips Copilot-bearing active account — use 'gh -u <account> ...' for per-command identity)"),
 ]
 
 # Pre-compiled variant used by the hot-path matcher. Building these at module
