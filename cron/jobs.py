@@ -689,31 +689,38 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
                 # Track delivery failures separately — cleared on successful delivery
                 job["last_delivery_error"] = delivery_error
                 
+                kind = job.get("schedule", {}).get("kind")
+
                 # Increment completed count
+                limit_reached = False
                 if job.get("repeat"):
                     job["repeat"]["completed"] = job["repeat"].get("completed", 0) + 1
-                    
-                    # Check if we've hit the repeat limit
                     times = job["repeat"].get("times")
                     completed = job["repeat"]["completed"]
                     if times is not None and times > 0 and completed >= times:
-                        # Remove the job (limit reached)
-                        jobs.pop(i)
-                        save_jobs(jobs)
-                        return
-                
-                # Compute next run
-                job["next_run_at"] = compute_next_run(job["schedule"], now)
+                        limit_reached = True
 
-                # If no next run, decide whether this is terminal completion
-                # (one-shot) or a transient failure (recurring schedule couldn't
-                # compute — e.g. 'croniter' missing from the runtime env).
-                # Recurring jobs must NEVER be silently disabled: that turns a
-                # missing runtime dep into "job completed" and the user's
-                # schedule quietly goes off. See issue #16265.
+                # Compute next run (None for finished one-shots / repeat-cap hits)
+                if limit_reached:
+                    job["next_run_at"] = None
+                else:
+                    job["next_run_at"] = compute_next_run(job["schedule"], now)
+
+                # Decide terminal vs cycling state.
+                #
+                # One-shots and repeat-capped jobs: success → state='completed'
+                # (preserve row, set completed_at, disable so it doesn't fire
+                # again).  Failed one-shots stay 'scheduled' to allow retry on
+                # the next tick (recoverable_oneshot_run_at handles that), or
+                # 'failed' if the limit has been reached and there is no
+                # retry window left.
+                #
+                # Recurring jobs (cron/interval) MUST keep cycling
+                # scheduled→running→scheduled.  If their next_run can't be
+                # computed (e.g. croniter missing), they become state='error'
+                # and stay enabled so the issue surfaces (issue #16265).
                 if job["next_run_at"] is None:
-                    kind = job.get("schedule", {}).get("kind")
-                    if kind in ("cron", "interval"):
+                    if kind in ("cron", "interval") and not limit_reached:
                         job["state"] = "error"
                         if not job.get("last_error"):
                             job["last_error"] = (
@@ -729,8 +736,21 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
                             kind,
                         )
                     else:
-                        job["enabled"] = False
-                        job["state"] = "completed"
+                        # Terminal: one-shot fired, or repeat limit reached.
+                        if success:
+                            job["state"] = "completed"
+                            job["completed_at"] = now
+                        elif limit_reached:
+                            job["state"] = "failed"
+                            job["completed_at"] = now
+                        else:
+                            # One-shot fail without limit cap: leave scheduled
+                            # so the recoverable-oneshot path can retry it.
+                            if job.get("state") != "paused":
+                                job["state"] = "scheduled"
+                        # Disable on terminal completion so it never re-fires.
+                        if job.get("state") in ("completed", "failed"):
+                            job["enabled"] = False
                 elif job.get("state") != "paused":
                     job["state"] = "scheduled"
 
