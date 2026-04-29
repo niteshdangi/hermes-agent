@@ -1110,7 +1110,21 @@ class HonchoSessionManager:
             logger.info("Created conclusion about %s for %s: %s", target_peer_id, session_key, content[:80])
             return True
         except Exception as e:
-            logger.error("Failed to create conclusion: %s", e)
+            # Surface underlying error: honcho SDK exceptions often carry the
+            # real cause in .response.text or .body; bare str(e) sometimes
+            # collapses to "An unexpected error occurred".
+            detail = ""
+            resp = getattr(e, "response", None)
+            if resp is not None:
+                try:
+                    detail = resp.text
+                except Exception:
+                    detail = ""
+            body = getattr(e, "body", None)
+            logger.error(
+                "Failed to create conclusion: %s: %s | response=%s | body=%s",
+                type(e).__name__, e, detail, body,
+            )
             return False
 
     def delete_conclusion(self, session_key: str, conclusion_id: str, peer: str = "user") -> bool:
