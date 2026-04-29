@@ -26,6 +26,13 @@ from typing import Optional
 
 _BLACKHOLE_DEVICE = "BlackHole 2ch"
 
+# Subprocess timeouts (seconds). pactl/system_profiler can hang indefinitely
+# if PulseAudio/CoreAudio is wedged; bounded waits prevent the Meet bot
+# setup from blocking the gateway worker forever.
+_PACTL_LOAD_TIMEOUT = 15.0
+_PACTL_UNLOAD_TIMEOUT = 10.0
+_SYSTEM_PROFILER_TIMEOUT = 20.0
+
 
 class AudioBridge:
     """Manages a virtual audio device for Chrome fake-mic input.
@@ -86,7 +93,11 @@ class AudioBridge:
                         ["pactl", "unload-module", str(mod_id)],
                         check=False,
                         capture_output=True,
+                        timeout=_PACTL_UNLOAD_TIMEOUT,
                     )
+                except subprocess.TimeoutExpired:
+                    # Best-effort teardown — never raise from here.
+                    pass
                 except Exception:
                     # Best-effort teardown — never raise from here.
                     pass
@@ -111,10 +122,15 @@ class AudioBridge:
                 check=True,
                 capture_output=True,
                 text=True,
+                timeout=_PACTL_LOAD_TIMEOUT,
             )
         except FileNotFoundError as exc:
             raise RuntimeError(
                 "pactl not found — install PulseAudio/pipewire-pulse"
+            ) from exc
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError(
+                f"pactl load-module null-sink timed out after {_PACTL_LOAD_TIMEOUT}s"
             ) from exc
         except subprocess.CalledProcessError as exc:
             raise RuntimeError(
@@ -135,13 +151,26 @@ class AudioBridge:
                 check=True,
                 capture_output=True,
                 text=True,
+                timeout=_PACTL_LOAD_TIMEOUT,
             )
+        except subprocess.TimeoutExpired as exc:
+            # Roll back the null-sink so we don't leak it.
+            subprocess.run(
+                ["pactl", "unload-module", str(sink_mod_id)],
+                check=False,
+                capture_output=True,
+                timeout=_PACTL_UNLOAD_TIMEOUT,
+            )
+            raise RuntimeError(
+                f"pactl load-module virtual-source timed out after {_PACTL_LOAD_TIMEOUT}s"
+            ) from exc
         except subprocess.CalledProcessError as exc:
             # Roll back the null-sink we just created so we don't leak it.
             subprocess.run(
                 ["pactl", "unload-module", str(sink_mod_id)],
                 check=False,
                 capture_output=True,
+                timeout=_PACTL_UNLOAD_TIMEOUT,
             )
             raise RuntimeError(
                 f"pactl load-module virtual-source failed: {exc.stderr or exc}"
@@ -170,10 +199,15 @@ class AudioBridge:
                 ["system_profiler", "SPAudioDataType"],
                 text=True,
                 stderr=subprocess.STDOUT,
+                timeout=_SYSTEM_PROFILER_TIMEOUT,
             )
         except FileNotFoundError as exc:
             raise RuntimeError(
                 "system_profiler not found (macOS-only command)"
+            ) from exc
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError(
+                f"system_profiler timed out after {_SYSTEM_PROFILER_TIMEOUT}s"
             ) from exc
         except subprocess.CalledProcessError as exc:
             raise RuntimeError(
