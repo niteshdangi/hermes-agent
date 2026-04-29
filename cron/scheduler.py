@@ -205,17 +205,6 @@ def _resolve_single_delivery_target(job: dict, deliver_value: str) -> Optional[d
     if deliver_value == "local":
         return None
 
-    # Atlas triage — resolves to the same destination as `origin` (the triage
-    # response is delivered there). The triage hop itself runs upstream in
-    # _process_job before _deliver_result is called, so by this point the
-    # `content` we'll deliver is already the curated triage response.
-    if deliver_value in ("atlas", "via-atlas"):
-        deliver_value = "origin"
-
-    # `atlas:<rest>` form — treat as origin too (rest reserved for future use).
-    if deliver_value.startswith("atlas:") or deliver_value.startswith("via-atlas:"):
-        deliver_value = "origin"
-
     if deliver_value == "origin":
         if origin:
             return {
@@ -1385,40 +1374,6 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
                 if should_deliver and success and SILENT_MARKER in deliver_content.strip().upper():
                     logger.info("Job '%s': agent returned %s — skipping delivery", job["id"], SILENT_MARKER)
                     should_deliver = False
-
-                # Atlas triage hop — when deliver=atlas (or via-atlas), pass the
-                # cron output through a fresh Atlas turn, archive it, and let
-                # Atlas decide what (if anything) Nitesh actually sees.
-                try:
-                    from cron.atlas_triage import (
-                        is_triage_target,
-                        triage_disabled,
-                        archive_cron_output,
-                        run_triage_turn,
-                        SILENT_MARKER as TRIAGE_SILENT,
-                    )
-                    deliver_value = str(job.get("deliver", "local") or "")
-                    if is_triage_target(deliver_value) and not triage_disabled():
-                        archive_status = "ok" if success else "failed"
-                        archive_cron_output(job, deliver_content or "", status=archive_status)
-                        if should_deliver:
-                            triaged = run_triage_turn(
-                                job, deliver_content, status=archive_status,
-                            )
-                            if triaged and TRIAGE_SILENT in triaged.strip().upper() and success:
-                                logger.info(
-                                    "Job '%s': Atlas triage decided [SILENT] — suppressing delivery",
-                                    job["id"],
-                                )
-                                should_deliver = False
-                                deliver_content = ""
-                            else:
-                                deliver_content = triaged or deliver_content
-                except Exception as triage_exc:
-                    logger.exception(
-                        "Job '%s': Atlas triage hop failed, falling back to raw delivery: %s",
-                        job["id"], triage_exc,
-                    )
 
                 delivery_error = None
                 if should_deliver:
