@@ -334,6 +334,21 @@ class Mem0MemoryProvider(MemoryProvider):
         with self._prefetch_lock:
             result = self._prefetch_result
             self._prefetch_result = ""
+        # Synchronous fallback: if no queued result is available (e.g. first
+        # turn before any queue_prefetch fired, or direct prefetch_all call
+        # outside the agent loop), perform the search inline so callers don't
+        # silently get "".  Cheap because it's the same _do_search path.
+        if not result and query and not self._is_breaker_open():
+            try:
+                client = self._get_client()
+                results = self._do_search(client, query, top_k=15, rerank=self._rerank)
+                if results:
+                    lines = [r.get("memory", "") for r in results if r.get("memory")]
+                    result = "\n".join(f"- {l}" for l in lines)
+                self._record_success()
+            except Exception as e:
+                self._record_failure()
+                logger.debug("Mem0 sync prefetch failed: %s", e)
         if not result:
             return ""
         return f"## Mem0 Memory\n{result}"
@@ -345,7 +360,7 @@ class Mem0MemoryProvider(MemoryProvider):
         def _run():
             try:
                 client = self._get_client()
-                results = self._do_search(client, query, top_k=5, rerank=self._rerank)
+                results = self._do_search(client, query, top_k=15, rerank=self._rerank)
                 if results:
                     lines = [r.get("memory", "") for r in results if r.get("memory")]
                     with self._prefetch_lock:
