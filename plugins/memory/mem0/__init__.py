@@ -40,6 +40,32 @@ _BREAKER_COOLDOWN_SECS = 120
 
 _VALID_BACKENDS = ("cloud", "local")
 
+# Cap each role's content sent to mem0 fact-extraction independently, to keep
+# the combined payload well under any LLM context window. ~8K tokens per role
+# at ~4 chars/token. Override via HERMES_MEM0_SYNC_MAX_CHARS.
+try:
+    MEM0_SYNC_MAX_CHARS_PER_ROLE = int(os.environ.get("HERMES_MEM0_SYNC_MAX_CHARS", "32000"))
+except (TypeError, ValueError):
+    MEM0_SYNC_MAX_CHARS_PER_ROLE = 32000
+
+
+def _truncate_for_extraction(text: str, max_chars: int) -> str:
+    """Cap ``text`` at ``max_chars``, preserving head 60% + tail 40%.
+
+    Fact extraction cares most about the user's intent (head) and the
+    assistant's conclusions (tail); verbose tool I/O usually lives in the
+    middle and is the safest thing to drop.
+    """
+    if text is None:
+        return text
+    if len(text) <= max_chars:
+        return text
+    head_len = int(max_chars * 0.6)
+    tail_len = max_chars - head_len  # ~40%
+    removed = len(text) - head_len - tail_len
+    marker = f"\n\n[... truncated {removed} chars for mem0 fact extraction ...]\n\n"
+    return text[:head_len] + marker + text[-tail_len:]
+
 
 # ---------------------------------------------------------------------------
 # Config
@@ -381,9 +407,19 @@ class Mem0MemoryProvider(MemoryProvider):
         def _sync():
             try:
                 client = self._get_client()
+                orig_user_len = len(user_content) if user_content else 0
+                orig_asst_len = len(assistant_content) if assistant_content else 0
+                u = _truncate_for_extraction(user_content, MEM0_SYNC_MAX_CHARS_PER_ROLE)
+                a = _truncate_for_extraction(assistant_content, MEM0_SYNC_MAX_CHARS_PER_ROLE)
+                if (u is not None and len(u) != orig_user_len) or (a is not None and len(a) != orig_asst_len):
+                    logger.debug(
+                        "Mem0 sync truncated: user=%d→%d chars, assistant=%d→%d chars",
+                        orig_user_len, len(u) if u else 0,
+                        orig_asst_len, len(a) if a else 0,
+                    )
                 messages = [
-                    {"role": "user", "content": user_content},
-                    {"role": "assistant", "content": assistant_content},
+                    {"role": "user", "content": u},
+                    {"role": "assistant", "content": a},
                 ]
                 self._do_add(client, messages, infer=True)
                 self._record_success()
