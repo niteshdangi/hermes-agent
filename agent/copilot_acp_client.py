@@ -309,6 +309,49 @@ class _ACPChatNamespace:
         self.completions = _ACPChatCompletions(client)
 
 
+class _AsyncACPChatCompletions:
+    """Async shim — runs the sync ACP subprocess call in a worker thread."""
+
+    def __init__(self, client: "CopilotACPClient"):
+        self._client = client
+
+    async def create(self, **kwargs: Any) -> Any:
+        import asyncio
+
+        return await asyncio.to_thread(
+            self._client._create_chat_completion, **kwargs
+        )
+
+
+class _AsyncACPChatNamespace:
+    def __init__(self, client: "CopilotACPClient"):
+        self.completions = _AsyncACPChatCompletions(client)
+
+
+class AsyncCopilotACPClient:
+    """Async-compatible facade for CopilotACPClient.
+
+    The underlying ACP client drives a subprocess synchronously; we expose
+    an awaitable ``chat.completions.create`` by dispatching to a worker
+    thread via ``asyncio.to_thread``. Without this wrapper, callers that
+    ``await client.chat.completions.create(...)`` get a TypeError because
+    the sync method returns a ``types.SimpleNamespace`` (not a coroutine).
+    """
+
+    def __init__(self, sync_client: "CopilotACPClient"):
+        self._sync = sync_client
+        self.chat = _AsyncACPChatNamespace(sync_client)
+        self.api_key = sync_client.api_key
+        self.base_url = sync_client.base_url
+
+    @property
+    def is_closed(self) -> bool:
+        return self._sync.is_closed
+
+    def close(self) -> None:
+        self._sync.close()
+
+
 class CopilotACPClient:
     """Minimal OpenAI-client-compatible facade for Copilot ACP."""
 

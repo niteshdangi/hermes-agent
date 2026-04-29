@@ -1839,9 +1839,9 @@ def _to_async_client(sync_client, model: str, is_vision: bool = False):
     except ImportError:
         pass
     try:
-        from agent.copilot_acp_client import CopilotACPClient
+        from agent.copilot_acp_client import CopilotACPClient, AsyncCopilotACPClient
         if isinstance(sync_client, CopilotACPClient):
-            return sync_client, model
+            return AsyncCopilotACPClient(sync_client), model
     except ImportError:
         pass
 
