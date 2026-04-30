@@ -19,6 +19,11 @@ from .core import (
     load_seen_ids,
     DEFAULT_DUE_OFFSET_DAYS,
 )
+from .payments import (
+    find_payment_confirmation,
+    mark_bill_paid,
+    sweep_paid_bills,
+)
 
 __all__ = [
     "is_bill_email",
@@ -28,4 +33,7 @@ __all__ = [
     "process_bill",
     "load_seen_ids",
     "DEFAULT_DUE_OFFSET_DAYS",
+    "find_payment_confirmation",
+    "mark_bill_paid",
+    "sweep_paid_bills",
 ]
