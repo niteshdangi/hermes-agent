@@ -2268,6 +2268,45 @@ class GatewayRunner:
     def request_restart(self, *, detached: bool = False, via_service: bool = False) -> bool:
         if self._restart_task_started:
             return False
+        # ── circuit breaker ────────────────────────────────────────────
+        # Refuse to restart twice within HERMES_RESTART_COOLDOWN_SEC
+        # (default 60s) of the last restart, unless HERMES_FORCE_RESTART
+        # is truthy.  Persists across processes via a marker file in
+        # HERMES_HOME so a freshly-started gateway still honours the
+        # cooldown set by its predecessor.  Caller should treat False
+        # like the existing in-process dedup (already-requested).
+        try:
+            import time as _time
+            from hermes_constants import get_hermes_home
+            cooldown = float(os.environ.get("HERMES_RESTART_COOLDOWN_SEC", "60") or 60)
+            force = os.environ.get("HERMES_FORCE_RESTART", "").lower() in ("1", "true", "yes")
+            marker = get_hermes_home() / ".gateway-last-restart"
+            now = _time.time()
+            stack = "".join(__import__("traceback").format_stack(limit=8))
+            if not force and marker.exists():
+                try:
+                    last = float(marker.read_text().strip() or 0)
+                except Exception:
+                    last = 0.0
+                if last and (now - last) < cooldown:
+                    logger.warning(
+                        "[circuit-breaker] Restart suppressed: %.1fs since last restart "
+                        "(cooldown=%.0fs). Set HERMES_FORCE_RESTART=1 to override. "
+                        "detached=%s via_service=%s\nCallstack:\n%s",
+                        now - last, cooldown, detached, via_service, stack,
+                    )
+                    return False
+            try:
+                marker.parent.mkdir(parents=True, exist_ok=True)
+                marker.write_text(str(now))
+            except Exception:
+                pass
+            logger.info(
+                "[restart] request_restart detached=%s via_service=%s\nCallstack:\n%s",
+                detached, via_service, stack,
+            )
+        except Exception as _cb_err:
+            logger.debug("circuit-breaker check failed: %s", _cb_err)
         self._restart_requested = True
         self._restart_detached = detached
         self._restart_via_service = via_service
