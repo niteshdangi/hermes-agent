@@ -5179,7 +5179,29 @@ class GatewayRunner:
             # shutdown) — the turn ran to completion, so recovery
             # succeeded and subsequent messages should no longer receive
             # the restart-interruption system note.
-            if session_key:
+            #
+            # CRITICAL: skip the clear when the agent returned because it
+            # was interrupted (e.g. by the gateway's own drain-timeout
+            # ``_interrupt_running_agents()`` path on shutdown/restart).
+            # That code path runs in this exact order during a forced
+            # drain-timeout takeover:
+            #   1. stop() marks the session resume_pending=True
+            #   2. stop() interrupts the running agent
+            #   3. the agent's tool loop returns {"interrupted": True,
+            #      "final_response": "Operation interrupted ..."}
+            #   4. control returns HERE — falsely treating that
+            #      short interrupt-acknowledgement string as "the turn
+            #      completed successfully" and wiping the resume marker
+            #      we just set. The next gateway startup then runs
+            #      ``suspend_recently_active()`` (which only skips
+            #      ``resume_pending=True`` entries), promotes the session
+            #      to ``suspended=True``, and the user's next message
+            #      gets a brand-new session instead of an auto-resume.
+            # An interrupted return is NOT a successful turn — preserve
+            # the resume_pending flag so the next message reloads the
+            # transcript and the model continues where it left off.
+            _agent_was_interrupted = bool(agent_result.get("interrupted"))
+            if session_key and not _agent_was_interrupted:
                 self._clear_restart_failure_count(session_key)
                 try:
                     self.session_store.clear_resume_pending(session_key)

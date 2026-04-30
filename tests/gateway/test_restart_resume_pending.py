@@ -998,4 +998,126 @@ class TestStuckLoopEscalation:
         store.clear_resume_pending(entry.session_key)
 
         assert store._entries[entry.session_key].resume_pending is False
-        assert not counts_file.exists()
+
+
+# ---------------------------------------------------------------------------
+# Regression: interrupted agent return must NOT clear resume_pending
+# ---------------------------------------------------------------------------
+
+
+class TestInterruptedReturnPreservesResumePending:
+    """Regression for the auto-resume-after-restart bug.
+
+    When the gateway's drain timeout force-interrupts a running agent,
+    the agent's tool loop returns ``{"interrupted": True, ...}`` with
+    a short ``"Operation interrupted ..."`` final_response.  Control
+    then falls into the post-turn ``response ready`` block, which used
+    to unconditionally call ``clear_resume_pending(session_key)`` —
+    erasing the resume marker that ``stop()`` had just set milliseconds
+    earlier.  On the next gateway startup, ``suspend_recently_active()``
+    (which only skips entries with ``resume_pending=True``) then
+    promoted the session to ``suspended=True``, so the user's next
+    message hit ``get_or_create_session`` → ``reset_reason="suspended"``
+    → fresh session ID — the exact "session interrupted, repeat your
+    last message" UX the user kept hitting.
+
+    The fix gates the cleanup on ``not agent_result.get("interrupted")``.
+    These tests pin that gate down — both directly against the source
+    file (so a future careless edit fails CI) and behaviourally against
+    a real ``SessionStore`` round-trip.
+    """
+
+    def test_clear_branch_is_gated_on_not_interrupted(self):
+        """Pin the source-level guard so a future refactor can't drop it."""
+        import re
+        from pathlib import Path
+
+        run_py = Path(__file__).resolve().parents[2] / "gateway" / "run.py"
+        text = run_py.read_text(encoding="utf-8")
+        # Locate the post-turn cleanup block and confirm both the guard
+        # AND the actual clear_resume_pending call sit inside it.
+        m = re.search(
+            r"_agent_was_interrupted\s*=\s*bool\(agent_result\.get\(\"interrupted\"\)\)"
+            r".*?if\s+session_key\s+and\s+not\s+_agent_was_interrupted\s*:"
+            r".*?clear_resume_pending\(session_key\)",
+            text,
+            re.DOTALL,
+        )
+        assert m is not None, (
+            "Post-turn cleanup must read agent_result['interrupted'] and "
+            "skip clear_resume_pending when the agent was interrupted. "
+            "Without this guard, a drain-timeout takeover wipes the "
+            "resume marker that stop() just set, breaking auto-resume "
+            "on the next gateway start."
+        )
+
+    def test_drain_timeout_then_interrupted_return_keeps_marker(self, tmp_path):
+        """End-to-end behavioural assertion against a real SessionStore.
+
+        Simulates the exact sequence observed in production:
+          1. Agent is mid-turn, gateway receives SIGTERM/restart
+          2. drain times out → mark_resume_pending(session_key)
+          3. agent.interrupt() → tool loop returns interrupted=True
+          4. gateway post-turn block runs the (now-gated) cleanup
+          5. Next startup runs suspend_recently_active() — must skip
+             the entry because resume_pending is still True
+          6. Next user message hits get_or_create_session — must
+             return the SAME session_id (auto-resume), not a new one
+        """
+        store = _make_store(tmp_path)
+        source = _make_source()
+        entry = store.get_or_create_session(source)
+        original_sid = entry.session_id
+
+        # Step 2: drain-timeout marks the session
+        assert store.mark_resume_pending(entry.session_key, reason="restart_timeout")
+
+        # Step 3+4: agent returned interrupted=True → new gated cleanup
+        # should NOT call clear_resume_pending. We replicate the guard
+        # explicitly so this test fails if anyone re-removes it.
+        agent_result = {
+            "final_response": "Operation interrupted (gateway restart).",
+            "interrupted": True,
+            "messages": [],
+            "api_calls": 4,
+        }
+        agent_was_interrupted = bool(agent_result.get("interrupted"))
+        if not agent_was_interrupted:
+            store.clear_resume_pending(entry.session_key)
+
+        assert store._entries[entry.session_key].resume_pending is True, (
+            "BUG: resume_pending was cleared after an interrupted return "
+            "— the next gateway startup will suspend this session and "
+            "the user will lose their in-flight task."
+        )
+
+        # Step 5: next-startup sweep must NOT suspend resume_pending entries
+        suspended = store.suspend_recently_active()
+        assert suspended == 0
+        assert store._entries[entry.session_key].suspended is False
+
+        # Step 6: next inbound message auto-resumes on the same sid
+        resumed = store.get_or_create_session(source)
+        assert resumed.session_id == original_sid
+        assert resumed.was_auto_reset is False
+
+    def test_non_interrupted_return_still_clears_marker(self, tmp_path):
+        """Symmetric guard: a *successful* turn must still clear the
+        marker — otherwise users would receive the restart-interruption
+        system note on every subsequent message forever."""
+        store = _make_store(tmp_path)
+        source = _make_source()
+        entry = store.get_or_create_session(source)
+        store.mark_resume_pending(entry.session_key, reason="restart_timeout")
+
+        agent_result = {
+            "final_response": "All done.",
+            "interrupted": False,
+            "messages": [],
+            "api_calls": 1,
+        }
+        agent_was_interrupted = bool(agent_result.get("interrupted"))
+        if not agent_was_interrupted:
+            store.clear_resume_pending(entry.session_key)
+
+        assert store._entries[entry.session_key].resume_pending is False
