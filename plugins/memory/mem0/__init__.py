@@ -41,12 +41,24 @@ _BREAKER_COOLDOWN_SECS = 120
 _VALID_BACKENDS = ("cloud", "local")
 
 # Cap each role's content sent to mem0 fact-extraction independently, to keep
-# the combined payload well under any LLM context window. ~8K tokens per role
-# at ~4 chars/token. Override via HERMES_MEM0_SYNC_MAX_CHARS.
+# the combined payload well under any LLM context window. Override via
+# HERMES_MEM0_SYNC_MAX_CHARS (per-role).
 try:
-    MEM0_SYNC_MAX_CHARS_PER_ROLE = int(os.environ.get("HERMES_MEM0_SYNC_MAX_CHARS", "32000"))
+    MEM0_SYNC_MAX_CHARS_PER_ROLE = int(os.environ.get("HERMES_MEM0_SYNC_MAX_CHARS", "12000"))
 except (TypeError, ValueError):
-    MEM0_SYNC_MAX_CHARS_PER_ROLE = 32000
+    MEM0_SYNC_MAX_CHARS_PER_ROLE = 12000
+
+# Hard cap on the COMBINED user+assistant payload sent to mem0.add(). mem0 wraps
+# the messages in its own fact-extraction prompt and forwards the whole thing to
+# an LLM (here: gpt-5-mini via local gateway). Even with per-role caps, very
+# long turns on both sides combined have busted the upstream context window
+# ("input length exceeds the context length", 400). This total cap is the
+# backstop; if the combined payload exceeds it, we shrink each side
+# proportionally while preserving message-pair structure.
+try:
+    MEM0_SYNC_MAX_CHARS_TOTAL = int(os.environ.get("HERMES_MEM0_SYNC_MAX_CHARS_TOTAL", "24000"))
+except (TypeError, ValueError):
+    MEM0_SYNC_MAX_CHARS_TOTAL = 24000
 
 
 def _truncate_for_extraction(text: str, max_chars: int) -> str:
@@ -411,11 +423,38 @@ class Mem0MemoryProvider(MemoryProvider):
                 orig_asst_len = len(assistant_content) if assistant_content else 0
                 u = _truncate_for_extraction(user_content, MEM0_SYNC_MAX_CHARS_PER_ROLE)
                 a = _truncate_for_extraction(assistant_content, MEM0_SYNC_MAX_CHARS_PER_ROLE)
+                # Combined-payload backstop: if both sides together still exceed
+                # MEM0_SYNC_MAX_CHARS_TOTAL, shrink each proportionally so mem0's
+                # extraction LLM never sees an over-context payload.
+                u_len = len(u) if u else 0
+                a_len = len(a) if a else 0
+                combined = u_len + a_len
+                if combined > MEM0_SYNC_MAX_CHARS_TOTAL and combined > 0:
+                    # Reserve at least 500 chars per non-empty side so neither
+                    # gets truncated to nothing useful.
+                    budget = MEM0_SYNC_MAX_CHARS_TOTAL
+                    if u_len and a_len:
+                        u_share = max(500, int(budget * (u_len / combined)))
+                        a_share = max(500, budget - u_share)
+                        # Re-balance if the floors pushed us over budget
+                        if u_share + a_share > budget:
+                            over = u_share + a_share - budget
+                            if u_share > a_share:
+                                u_share = max(500, u_share - over)
+                            else:
+                                a_share = max(500, a_share - over)
+                        u = _truncate_for_extraction(u, u_share)
+                        a = _truncate_for_extraction(a, a_share)
+                    elif u_len:
+                        u = _truncate_for_extraction(u, budget)
+                    else:
+                        a = _truncate_for_extraction(a, budget)
                 if (u is not None and len(u) != orig_user_len) or (a is not None and len(a) != orig_asst_len):
                     logger.debug(
-                        "Mem0 sync truncated: user=%d→%d chars, assistant=%d→%d chars",
+                        "Mem0 sync truncated: user=%d→%d chars, assistant=%d→%d chars (cap_total=%d)",
                         orig_user_len, len(u) if u else 0,
                         orig_asst_len, len(a) if a else 0,
+                        MEM0_SYNC_MAX_CHARS_TOTAL,
                     )
                 messages = [
                     {"role": "user", "content": u},
