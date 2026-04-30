@@ -3678,6 +3678,37 @@ class GatewayRunner:
                     # Record rate limit so subsequent messages are silently ignored
                     self.pairing_store._record_rate_limit(platform_name, source.user_id)
             return None
+
+        # ──────────────────────────────────────────────────────────────────
+        # Atlas panic-phrase interceptor.
+        # Runs BEFORE any agent logic so a compromised LLM context can't
+        # talk Atlas out of locking down. Authorized-user check above already
+        # passed; we still record the source for incident review.
+        # ──────────────────────────────────────────────────────────────────
+        if not is_internal:
+            try:
+                from agent import atlas_panic as _atlas_panic  # type: ignore
+                _text = event.text or ""
+                _channel = source.platform.value if source.platform else "unknown"
+                _atlas_panic.record_recent_message(_channel, _text)
+                if _atlas_panic.is_panic_phrase(_text):
+                    recent = _atlas_panic.get_recent_messages(_channel)
+                    _atlas_panic.trigger_lockdown(
+                        channel=_channel,
+                        message=_text,
+                        source_user=str(source.user_id) if source.user_id else None,
+                        source_ip=getattr(event, "source_ip", None),
+                        recent_messages=recent,
+                    )
+                    adapter = self.adapters.get(source.platform)
+                    if adapter:
+                        try:
+                            await adapter.send(source.chat_id, _atlas_panic.LOCKDOWN_REPLY)
+                        except Exception as _e:
+                            logger.error("lockdown reply failed: %s", _e)
+                    return None
+            except Exception as _e:
+                logger.error("panic-phrase interceptor failed: %s", _e)
         
         # Intercept messages that are responses to a pending /update prompt.
         # The update process (detached) wrote .update_prompt.json; the watcher

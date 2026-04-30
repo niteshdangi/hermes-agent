@@ -620,6 +620,36 @@ def handle_function_call(
     # Coerce string arguments to their schema-declared types (e.g. "42"→42)
     function_args = coerce_tool_args(function_name, function_args)
 
+    # Atlas lockdown gate: refuse destructive tools while locked, and audit
+    # every dispatch (locked or not). See agent/atlas_panic.py.
+    try:
+        from agent import atlas_panic as _atlas_panic  # type: ignore
+    except Exception:
+        _atlas_panic = None  # type: ignore
+
+    if _atlas_panic is not None:
+        try:
+            _destructive, _reason = _atlas_panic.is_destructive(function_name, function_args)
+        except Exception:
+            _destructive, _reason = False, ""
+        if _destructive and _atlas_panic.is_locked():
+            err = (
+                "Atlas is in lockdown. Action refused "
+                f"({_reason}). Manual SSH+local CLI unlock required."
+            )
+            try:
+                _atlas_panic.audit_tool_call(
+                    tool_name=function_name,
+                    args=function_args,
+                    result={"error": err},
+                    session_id=session_id,
+                    was_destructive=True,
+                    refused=True,
+                )
+            except Exception:
+                pass
+            return json.dumps({"error": err}, ensure_ascii=False)
+
     try:
         if function_name in _AGENT_LOOP_TOOLS:
             return json.dumps({"error": f"{function_name} must be handled by the agent loop"})
@@ -708,6 +738,19 @@ def handle_function_call(
         except Exception:
             pass
 
+        # Atlas append-only audit trail.
+        if _atlas_panic is not None:
+            try:
+                _atlas_panic.audit_tool_call(
+                    tool_name=function_name,
+                    args=function_args,
+                    result=result,
+                    session_id=session_id,
+                    was_destructive=_destructive,
+                )
+            except Exception:
+                pass
+
         # Generic tool-result canonicalization seam: plugins receive the
         # final result string (JSON, usually) and may replace it by
         # returning a string from transform_tool_result. Runs after
@@ -738,6 +781,16 @@ def handle_function_call(
     except Exception as e:
         error_msg = f"Error executing {function_name}: {str(e)}"
         logger.error(error_msg)
+        if _atlas_panic is not None:
+            try:
+                _atlas_panic.audit_tool_call(
+                    tool_name=function_name,
+                    args=function_args,
+                    result={"error": error_msg},
+                    session_id=session_id,
+                )
+            except Exception:
+                pass
         return json.dumps({"error": error_msg}, ensure_ascii=False)
 
 
