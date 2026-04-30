@@ -2638,6 +2638,21 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_post("/v1/runs", self._handle_runs)
             self._app.router.add_get("/v1/runs/{run_id}/events", self._handle_run_events)
             self._app.router.add_post("/v1/runs/{run_id}/stop", self._handle_stop_run)
+            # Atlas Mobile pairing + WS transport (Tailscale-only).
+            try:
+                from plugins.atlas.mobile import register_routes as _register_atlas_mobile
+                from plugins.atlas.mobile.chat_handler import make_identity_chat_handler
+                _register_atlas_mobile(
+                    self._app,
+                    chat_handler=make_identity_chat_handler(identity_id="nitesh"),
+                    identity_id="nitesh",
+                )
+                logger.info("[%s] atlas-mobile routes mounted", self.name)
+            except Exception as _atlas_exc:  # noqa: BLE001
+                logger.warning(
+                    "[%s] atlas-mobile routes not mounted: %s",
+                    self.name, _atlas_exc,
+                )
             # Start background sweep to clean up orphaned (unconsumed) run streams
             sweep_task = asyncio.create_task(self._sweep_orphaned_runs())
             try:

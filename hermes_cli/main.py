@@ -4918,6 +4918,56 @@ def cmd_cron(args):
     cron_command(args)
 
 
+def cmd_atlas(args):
+    """Atlas Mobile device registry management.
+
+    Subcommands:
+        hermes atlas devices              # list all devices
+        hermes atlas enroll <fp>          # promote pending → enrolled
+        hermes atlas revoke <fp>          # revoke an enrolled/pending device
+    """
+    from plugins.atlas.mobile import devices as _devs
+
+    sub = getattr(args, "atlas_command", None)
+    if sub in ("devices", "list"):
+        rows = _devs.list_devices()
+        if not rows:
+            print("(no devices registered)")
+            return
+        print(f"{'FP':<11} {'STATUS':<9} {'NAME':<24} {'CREATED':<12} {'LAST SEEN':<12}")
+        import datetime as _dt
+        def _fmt(ts):
+            if ts is None:
+                return "-"
+            return _dt.datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M")
+        for d in rows:
+            print(f"{d.fp:<11} {d.status:<9} {d.name[:24]:<24} {_fmt(d.created_at):<12} {_fmt(d.last_seen):<12}")
+        return
+    if sub == "enroll":
+        fp = args.fp
+        try:
+            dev = _devs.enroll(fp)
+        except KeyError:
+            print(f"error: unknown device {fp}")
+            sys.exit(1)
+        except ValueError as exc:
+            print(f"error: {exc}")
+            sys.exit(1)
+        print(f"enrolled {dev.fp} ({dev.name})")
+        return
+    if sub == "revoke":
+        fp = args.fp
+        try:
+            dev = _devs.revoke(fp)
+        except KeyError:
+            print(f"error: unknown device {fp}")
+            sys.exit(1)
+        print(f"revoked {dev.fp}")
+        return
+    print("usage: hermes atlas {devices|enroll <fp>|revoke <fp>}")
+    sys.exit(2)
+
+
 def cmd_webhook(args):
     """Webhook subscription management."""
     from hermes_cli.webhook import webhook_command
@@ -8625,6 +8675,27 @@ For more help on a command:
     _add_accept_hooks_flag(cron_tick)
     _add_accept_hooks_flag(cron_parser)
     cron_parser.set_defaults(func=cmd_cron)
+
+    # =========================================================================
+    # atlas — Atlas Mobile device pairing management
+    # =========================================================================
+    atlas_parser = subparsers.add_parser(
+        "atlas",
+        help="Atlas Mobile device pairing",
+        description="Manage paired Android devices for Atlas Mobile",
+    )
+    atlas_subparsers = atlas_parser.add_subparsers(dest="atlas_command")
+    atlas_subparsers.add_parser("devices", aliases=["list"], help="List paired devices")
+    _atlas_enroll = atlas_subparsers.add_parser(
+        "enroll", help="Enroll a pending device by fingerprint"
+    )
+    _atlas_enroll.add_argument("fp", help="Device fingerprint XXXX-XXXX")
+    _atlas_revoke = atlas_subparsers.add_parser(
+        "revoke", help="Revoke an enrolled or pending device"
+    )
+    _atlas_revoke.add_argument("fp", help="Device fingerprint XXXX-XXXX")
+    atlas_parser.set_defaults(func=cmd_atlas)
+
 
     # =========================================================================
     # webhook command
