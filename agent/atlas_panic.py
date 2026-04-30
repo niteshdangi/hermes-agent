@@ -50,6 +50,15 @@ def incidents_path() -> Path:
     return _audit_dir() / "incidents.md"
 
 
+def paused_crons_state_path() -> Path:
+    """State file recording which cron IDs were paused by lockdown trigger.
+
+    Auto-resume reads + deletes this on lockdown clear. Only crons we paused
+    are resumed (manually-paused-before-lockdown crons are untouched).
+    """
+    return _state_dir() / "lockdown-paused-crons.json"
+
+
 # --------------------------------------------------------------------------
 # Panic phrase
 # --------------------------------------------------------------------------
@@ -123,6 +132,16 @@ def trigger_lockdown(
             paused = []
         event["paused_cron_jobs"] = paused
         event["was_already_locked"] = already
+        # Persist paused IDs so we can auto-resume on lockdown clear.
+        if paused and not already:
+            try:
+                sp = paused_crons_state_path()
+                sp.parent.mkdir(parents=True, exist_ok=True)
+                with open(sp, "w", encoding="utf-8") as f:
+                    json.dump({"locked_at": ts, "paused_ids": list(paused)},
+                              f, indent=2, sort_keys=True)
+            except Exception as e:
+                logger.error("lockdown: paused-crons state write failed: %s", e)
         try:
             _append_incident(event)
         except Exception as e:
@@ -154,6 +173,47 @@ def manual_unlock() -> bool:
 # --------------------------------------------------------------------------
 # Cron pause
 # --------------------------------------------------------------------------
+
+def _resume_paused_crons() -> Tuple[List[str], List[str]]:
+    """Resume crons recorded in the paused-crons state file.
+
+    Returns (resumed_ids, missing_ids). Deletes the state file on success.
+    No-op (with warning) if the state file is missing.
+    """
+    sp = paused_crons_state_path()
+    if not sp.exists():
+        logger.warning("lockdown clear: no paused-crons state file at %s; skipping auto-resume", sp)
+        return [], []
+    try:
+        with open(sp, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception as e:
+        logger.error("lockdown clear: failed to read paused-crons state: %s", e)
+        return [], []
+    ids = list(data.get("paused_ids") or [])
+    resumed: List[str] = []
+    missing: List[str] = []
+    try:
+        from cron import jobs as cron_jobs
+    except Exception as e:
+        logger.warning("lockdown clear: cron module unavailable: %s", e)
+        return [], ids
+    for jid in ids:
+        try:
+            res = cron_jobs.resume_job(jid)
+            if res is None:
+                missing.append(jid)
+                logger.warning("lockdown clear: cron %s no longer exists; skipping", jid)
+            else:
+                resumed.append(jid)
+        except Exception as e:
+            logger.error("lockdown clear: failed to resume cron %s: %s", jid, e)
+    try:
+        sp.unlink()
+    except Exception:
+        pass
+    return resumed, missing
+
 
 def _pause_all_crons(reason: str) -> List[str]:
     paused: List[str] = []
@@ -586,15 +646,36 @@ def note_lockdown_state_transition() -> None:
                 duration_s = (datetime.now(timezone.utc) - t0).total_seconds()
         except Exception:
             duration_s = None
+        # Auto-resume crons we paused at lockdown trigger.
+        resumed_ids: List[str] = []
+        missing_ids: List[str] = []
+        try:
+            resumed_ids, missing_ids = _resume_paused_crons()
+        except Exception as e:
+            logger.error("lockdown clear: cron auto-resume failed: %s", e)
         payload = {
             "ts": datetime.now(timezone.utc).isoformat(),
             "locked_since": started,
             "duration_seconds": duration_s,
             "blocked_inbounds": n,
             "last_blocked_attempt": last,
+            "resumed_cron_jobs": resumed_ids,
+            "missing_cron_jobs": missing_ids,
         }
         try:
             audit_event(event_type="lockdown_cleared", channel=None, payload=payload)
+        except Exception:
+            pass
+        try:
+            audit_event(
+                event_type="lockdown_resumed_crons",
+                channel=None,
+                payload={
+                    "ts": payload["ts"],
+                    "resumed_ids": resumed_ids,
+                    "missing_ids": missing_ids,
+                },
+            )
         except Exception:
             pass
         try:

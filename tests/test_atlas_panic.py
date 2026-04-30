@@ -282,3 +282,106 @@ def test_hardseal_audit_records_blocked_during_lockdown():
     assert last["channel"] == "whatsapp"
     assert "ignored payload" in last["message_preview"]
     ap.manual_unlock()
+
+
+# ==========================================================================
+# Auto-resume of crons after lockdown clears.
+# ==========================================================================
+
+def test_lockdown_persists_paused_crons_state_file(monkeypatch):
+    """trigger_lockdown should write paused-crons state with correct shape."""
+    from agent import atlas_panic as ap
+
+    fake_jobs = [
+        {"id": "job-a", "enabled": True, "state": "scheduled"},
+        {"id": "job-b", "enabled": True, "state": "scheduled"},
+        {"id": "job-c", "enabled": False, "state": "paused"},  # already paused — skip
+    ]
+    paused_calls = []
+
+    class FakeCronJobs:
+        @staticmethod
+        def list_jobs(include_disabled=False):
+            return [j for j in fake_jobs if include_disabled or j.get("enabled")]
+
+        @staticmethod
+        def pause_job(jid, reason=None):
+            paused_calls.append(jid)
+            return {"id": jid, "state": "paused"}
+
+        @staticmethod
+        def resume_job(jid):
+            return {"id": jid, "state": "scheduled"}
+
+    import sys, types
+    fake_cron = types.ModuleType("cron")
+    fake_cron.jobs = FakeCronJobs  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "cron", fake_cron)
+    monkeypatch.setitem(sys.modules, "cron.jobs", FakeCronJobs)
+
+    ap.trigger_lockdown(channel="cli", message="atlas: lockdown")
+    sp = ap.paused_crons_state_path()
+    assert sp.exists(), "paused-crons state file should be written"
+    data = json.loads(sp.read_text())
+    assert "locked_at" in data
+    assert set(data["paused_ids"]) == {"job-a", "job-b"}
+    assert paused_calls == ["job-a", "job-b"]
+    ap.manual_unlock()
+
+
+def test_lockdown_clear_auto_resumes_paused_crons(monkeypatch):
+    """note_lockdown_state_transition resumes crons + emits audit event + deletes state."""
+    from agent import atlas_panic as ap
+
+    fake_jobs = [
+        {"id": "job-a", "enabled": True, "state": "scheduled"},
+        {"id": "job-b", "enabled": True, "state": "scheduled"},
+    ]
+    resumed_calls = []
+
+    class FakeCronJobs:
+        @staticmethod
+        def list_jobs(include_disabled=False):
+            return list(fake_jobs)
+
+        @staticmethod
+        def pause_job(jid, reason=None):
+            return {"id": jid, "state": "paused"}
+
+        @staticmethod
+        def resume_job(jid):
+            resumed_calls.append(jid)
+            if jid == "job-gone":
+                return None
+            return {"id": jid, "state": "scheduled"}
+
+    import sys, types
+    fake_cron = types.ModuleType("cron")
+    fake_cron.jobs = FakeCronJobs  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "cron", fake_cron)
+    monkeypatch.setitem(sys.modules, "cron.jobs", FakeCronJobs)
+
+    ap.trigger_lockdown(channel="cli", message="atlas: lockdown")
+    # Tamper: pretend one of the paused crons was deleted before clear.
+    sp = ap.paused_crons_state_path()
+    data = json.loads(sp.read_text())
+    data["paused_ids"].append("job-gone")
+    sp.write_text(json.dumps(data))
+
+    # First intercept observes locked state.
+    ap.gateway_intercept(channel="telegram", text="hi", sender="1",
+                          chat_id="c1", is_authorized=True)
+    # Operator removes flag manually (simulates SSH unlock).
+    ap.manual_unlock()
+    # Next inbound triggers transition.
+    ap.gateway_intercept(channel="telegram", text="hello", sender="1",
+                          chat_id="c1", is_authorized=True)
+
+    assert set(resumed_calls) >= {"job-a", "job-b", "job-gone"}
+    assert not sp.exists(), "state file should be deleted after auto-resume"
+    recs = _read_audit_records()
+    resumed_evs = [r for r in recs if r.get("event_type") == "lockdown_resumed_crons"]
+    assert resumed_evs, "lockdown_resumed_crons audit event missing"
+    payload = resumed_evs[-1]["payload"]
+    assert set(payload["resumed_ids"]) == {"job-a", "job-b"}
+    assert "job-gone" in payload["missing_ids"]
