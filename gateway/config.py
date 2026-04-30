@@ -22,6 +22,13 @@ from utils import is_truthy_value
 logger = logging.getLogger(__name__)
 
 
+def _empty_identity_registry():
+    """Lazy import so config.py stays import-safe even if identity has issues."""
+    from .identity import IdentityRegistry
+    return IdentityRegistry(identities=[])
+
+
+
 def _coerce_bool(value: Any, default: bool = True) -> bool:
     """Coerce bool-ish config values, preserving a caller-provided default."""
     if value is None:
@@ -271,6 +278,13 @@ class GatewayConfig:
     # Streaming configuration
     streaming: StreamingConfig = field(default_factory=StreamingConfig)
 
+    # User identity registry — maps (platform, chat_id) tuples to a
+    # cross-channel identity so the same human gets one shared session
+    # transcript regardless of which channel they message in on.
+    # Empty by default → all users behave with the historical
+    # per-channel session key (backward-compatible).
+    identities: "IdentityRegistry" = field(default_factory=lambda: _empty_identity_registry())
+
     # Session store pruning: drop SessionEntry records older than this many
     # days from the in-memory dict and sessions.json.  Keeps the store from
     # growing unbounded in gateways serving many chats/threads/users over
@@ -443,6 +457,9 @@ class GatewayConfig:
         except (TypeError, ValueError):
             session_store_max_age_days = 90
 
+        from .identity import IdentityRegistry
+        identities = IdentityRegistry.from_config(data.get("identities"))
+
         return cls(
             platforms=platforms,
             default_reset_policy=default_policy,
@@ -458,6 +475,7 @@ class GatewayConfig:
             unauthorized_dm_behavior=unauthorized_dm_behavior,
             streaming=StreamingConfig.from_dict(data.get("streaming", {})),
             session_store_max_age_days=session_store_max_age_days,
+            identities=identities,
         )
 
     def get_unauthorized_dm_behavior(self, platform: Optional[Platform] = None) -> str:
@@ -540,6 +558,11 @@ def load_gateway_config() -> GatewayConfig:
 
             if "reset_triggers" in yaml_cfg:
                 gw_data["reset_triggers"] = yaml_cfg["reset_triggers"]
+
+            if "identities" in yaml_cfg:
+                # Pass through the raw identities block; IdentityRegistry.from_config
+                # validates and tolerates malformed entries.
+                gw_data["identities"] = yaml_cfg["identities"]
 
             if "always_log_local" in yaml_cfg:
                 gw_data["always_log_local"] = yaml_cfg["always_log_local"]

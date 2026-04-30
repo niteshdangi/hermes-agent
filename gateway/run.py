@@ -1185,6 +1185,27 @@ class GatewayRunner:
             thread_sessions_per_user=getattr(config, "thread_sessions_per_user", False),
         )
 
+    def _resolve_identity_id_for_source(self, source: SessionSource) -> Optional[str]:
+        """Look up the cross-channel identity_id for a source, or None.
+
+        Used by the lockdown intercept (which runs before session creation)
+        so audit log entries carry the correct identity even when the
+        message is blocked before the SessionStore is touched.
+        """
+        try:
+            registry = getattr(self.config, "identities", None)
+            if registry is None or not getattr(registry, "identities", None):
+                return None
+            from gateway.config import Platform as _P
+            if source.platform != _P.LOCAL and getattr(source, "chat_type", "dm") != "dm":
+                return None
+            pv = source.platform.value if source.platform else None
+            ident = registry.resolve(pv, source.chat_id)
+            return ident.identity_id if ident else None
+        except Exception:
+            return None
+
+
     def _resolve_session_agent_runtime(
         self,
         *,
@@ -3662,6 +3683,7 @@ class GatewayRunner:
                     sender=str(source.user_id) if source.user_id else None,
                     chat_id=str(source.chat_id) if source.chat_id else None,
                     is_authorized=_is_auth,
+                    identity_id=self._resolve_identity_id_for_source(source),
                 )
                 _action = _verdict.get("action")
                 _reply = _verdict.get("reply")
@@ -4679,6 +4701,22 @@ class GatewayRunner:
         # Get or create session
         session_entry = self.session_store.get_or_create_session(source)
         session_key = session_entry.session_key
+
+        # Cross-channel identity: prefix the inbound text with a channel
+        # tag so the transcript records which channel each turn arrived
+        # on.  Without this, an identity session blurs Telegram and
+        # WhatsApp turns into one anonymous stream and the agent can't
+        # say "as I told you on Telegram earlier...".  Only applied when
+        # an identity is bound — non-identity users see no change.
+        if getattr(session_entry, "identity_id", None):
+            try:
+                from gateway.session import format_channel_tag as _fct
+                _tag = _fct(source.platform)
+                if _tag and event.text and not event.text.lstrip().startswith(_tag):
+                    event = dataclasses.replace(event, text=f"{_tag} {event.text}")
+            except Exception as _e:
+                logger.debug("channel-tag injection skipped: %s", _e)
+
         if getattr(session_entry, "was_auto_reset", False):
             # Treat auto-reset as a full conversation boundary — drop every
             # session-scoped transient state so the fresh session does not

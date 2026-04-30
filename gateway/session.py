@@ -169,6 +169,12 @@ class SessionContext:
     connected_platforms: List[Platform]
     home_channels: Dict[Platform, HomeChannel]
     shared_multi_user_session: bool = False
+
+    # Cross-channel identity binding (None when no identity matched).
+    identity_id: Optional[str] = None
+    identity_display_name: Optional[str] = None
+    # All channels the matched identity is reachable on, for prompt context.
+    identity_channels: List[Dict[str, str]] = None  # [{platform, chat_id}, ...]
     
     # Session metadata
     session_key: str = ""
@@ -370,6 +376,23 @@ def build_session_context_prompt(
             platforms_list.append(f"{p.value}: Connected ✓")
     
     lines.append(f"**Connected Platforms:** {', '.join(platforms_list)}")
+
+    # Cross-channel identity awareness.
+    if context.identity_id:
+        lines.append("")
+        name = context.identity_display_name or context.identity_id
+        ch_lines = []
+        for ch in (context.identity_channels or []):
+            ch_lines.append(f"{ch.get('platform')}:{ch.get('chat_id')}")
+        ch_str = ", ".join(ch_lines) if ch_lines else "multiple channels"
+        lines.append(
+            f"**Cross-channel identity:** This conversation belongs to "
+            f"`{context.identity_id}` ({name}). The same person reaches you on: {ch_str}. "
+            f"Past messages are tagged with [via Telegram], [via WhatsApp], [via CLI] etc. "
+            f"to indicate which channel each turn arrived on. The current turn is "
+            f"{format_channel_tag(context.source.platform)}. "
+            f"Treat all channels as one continuous conversation."
+        )
     
     # Home channels
     if context.home_channels:
@@ -408,6 +431,34 @@ def build_session_context_prompt(
     lines.append("*For explicit targeting, use `\"platform:chat_id\"` format if the user provides a specific chat ID.*")
     
     return "\n".join(lines)
+
+
+def format_channel_tag(platform: Optional[Platform]) -> str:
+    """Return a short bracketed channel tag like ``[via Telegram]``.
+
+    Used to prefix user messages stored in identity transcripts so the
+    agent (re-reading history across channels) knows which channel each
+    past turn arrived on.  Returns an empty string for unknown
+    platforms so callers can blindly concatenate.
+    """
+    if platform is None:
+        return ""
+    if platform == Platform.LOCAL:
+        return "[via CLI]"
+    label = platform.value.replace("_", " ").title()
+    # Tighten a few well-known names that .title() mangles.
+    overrides = {
+        "Whatsapp": "WhatsApp",
+        "Bluebubbles": "BlueBubbles (iMessage)",
+        "Wecom": "WeCom",
+        "Wecom Callback": "WeCom",
+        "Qqbot": "QQ",
+        "Dingtalk": "DingTalk",
+        "Sms": "SMS",
+        "Api Server": "API",
+    }
+    label = overrides.get(label, label)
+    return f"[via {label}]"
 
 
 @dataclass
@@ -471,6 +522,12 @@ class SessionEntry:
     resume_reason: Optional[str] = None  # e.g. "restart_timeout"
     last_resume_marked_at: Optional[datetime] = None
 
+    # When set, this entry belongs to a cross-channel identity declared in
+    # gateway config.  All channels mapped to the same identity share one
+    # session_key (``agent:identity:<identity_id>``) and one transcript.
+    # ``None`` for the legacy per-channel session path.
+    identity_id: Optional[str] = None
+
     def to_dict(self) -> Dict[str, Any]:
         result = {
             "session_key": self.session_key,
@@ -497,6 +554,7 @@ class SessionEntry:
                 if self.last_resume_marked_at
                 else None
             ),
+            "identity_id": self.identity_id,
         }
         if self.origin:
             result["origin"] = self.origin.to_dict()
@@ -545,6 +603,7 @@ class SessionEntry:
             resume_pending=data.get("resume_pending", False),
             resume_reason=data.get("resume_reason"),
             last_resume_marked_at=last_resume_marked_at,
+            identity_id=data.get("identity_id"),
         )
 
 
@@ -714,12 +773,41 @@ class SessionStore:
             raise
     
     def _generate_session_key(self, source: SessionSource) -> str:
-        """Generate a session key from a source."""
+        """Generate a session key from a source.
+
+        When the gateway config declares an identity matching this
+        (platform, chat_id), all of that identity's channels collapse to
+        a single shared key (``agent:identity:<id>``).  Otherwise we fall
+        back to the historical per-channel key — keeping behavior
+        identical for any user without an identity binding.
+        """
+        identity = self._resolve_identity(source)
+        if identity is not None:
+            return identity.session_key
         return build_session_key(
             source,
             group_sessions_per_user=getattr(self.config, "group_sessions_per_user", True),
             thread_sessions_per_user=getattr(self.config, "thread_sessions_per_user", False),
         )
+
+    def _resolve_identity(self, source: SessionSource):
+        """Resolve a SessionSource → Identity, or None if no match.
+
+        Only DMs are eligible for identity matching — group/channel
+        chats are inherently shared across multiple humans, and
+        collapsing those into one personal identity would mix unrelated
+        conversations.  CLI sessions (Platform.LOCAL) are matched
+        regardless of chat_type since the local CLI has no concept of
+        a real DM.
+        """
+        registry = getattr(self.config, "identities", None)
+        if registry is None or not getattr(registry, "identities", None):
+            return None
+        if source.platform != Platform.LOCAL and source.chat_type != "dm":
+            return None
+        platform_value = source.platform.value if source.platform else None
+        return registry.resolve(platform_value, source.chat_id)
+
     
     def _is_session_expired(self, entry: SessionEntry) -> bool:
         """Check if a session has expired based on its reset policy.
@@ -837,6 +925,8 @@ class SessionStore:
         Creates a session record in SQLite when a new session starts.
         """
         session_key = self._generate_session_key(source)
+        identity = self._resolve_identity(source)
+        identity_id = identity.identity_id if identity else None
         now = _now()
 
         # SQLite calls are made outside the lock to avoid holding it during I/O.
@@ -895,12 +985,13 @@ class SessionStore:
                 created_at=now,
                 updated_at=now,
                 origin=source,
-                display_name=source.chat_name,
+                display_name=(identity.display_name if identity else None) or source.chat_name,
                 platform=source.platform,
                 chat_type=source.chat_type,
                 was_auto_reset=was_auto_reset,
                 auto_reset_reason=auto_reset_reason,
                 reset_had_activity=reset_had_activity,
+                identity_id=identity_id,
             )
 
             self._entries[session_key] = entry
@@ -1348,6 +1439,21 @@ def build_session_context(
             thread_sessions_per_user=getattr(config, "thread_sessions_per_user", False),
         ),
     )
+
+    # Resolve cross-channel identity for prompt-side awareness.
+    registry = getattr(config, "identities", None)
+    if registry is not None and getattr(registry, "identities", None):
+        if source.platform == Platform.LOCAL or source.chat_type == "dm":
+            pv = source.platform.value if source.platform else None
+            ident = registry.resolve(pv, source.chat_id)
+            if ident is not None:
+                context.identity_id = ident.identity_id
+                context.identity_display_name = ident.display_name
+                context.identity_channels = [
+                    {"platform": ch.platform, "chat_id": ch.chat_id}
+                    for ch in ident.channels
+                ]
+
     
     if session_entry:
         context.session_key = session_entry.session_key

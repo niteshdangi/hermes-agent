@@ -541,6 +541,7 @@ def audit_blocked_inbound(
     sender: Optional[str],
     message: Optional[str],
     reason: str = "lockdown_active",
+    identity_id: Optional[str] = None,
 ) -> None:
     """Record an inbound message that was refused because Atlas is locked."""
     _bump_denied()
@@ -549,6 +550,7 @@ def audit_blocked_inbound(
         "event_type": "inbound_blocked",
         "channel": channel,
         "sender": sender,
+        "identity_id": identity_id,
         "reason": reason,
         "was_during_lockdown": True,
         "message_preview": _truncate(message or "", 200),
@@ -707,6 +709,7 @@ def gateway_intercept(
     sender: Optional[str],
     chat_id: Optional[str],
     is_authorized: bool,
+    identity_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Single hard-seal hook called by the gateway BEFORE auth + agent loop.
 
@@ -732,7 +735,7 @@ def gateway_intercept(
         else:
             reason = "lockdown_active"
         try:
-            audit_blocked_inbound(channel=channel, sender=sender, message=msg, reason=reason)
+            audit_blocked_inbound(channel=channel, sender=sender, message=msg, reason=reason, identity_id=identity_id)
         except Exception:
             pass
         if is_status:
@@ -753,7 +756,7 @@ def gateway_intercept(
             audit_event(
                 event_type="unauthorized_panic_attempt",
                 channel=channel,
-                payload={"sender": sender, "preview": _truncate(msg, 200)},
+                payload={"sender": sender, "preview": _truncate(msg, 200), "identity_id": identity_id},
             )
         except Exception:
             pass
