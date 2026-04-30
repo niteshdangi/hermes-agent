@@ -411,6 +411,270 @@ def get_recent_messages(channel: str) -> List[str]:
 
 
 LOCKDOWN_REPLY = (
-    "🔒 Atlas locked. Destructive ops disabled. "
-    "Only manual unlock via SSH+local CLI re-enables."
+    "🔒 Atlas locked. SSH to vm-atlas to unlock. Chat disabled."
 )
+
+
+# --------------------------------------------------------------------------
+# Status sentinel — works even when locked.
+# --------------------------------------------------------------------------
+
+STATUS_PHRASE_RE = re.compile(
+    r"""^\s*/?\s*atlas\s*[:\-,]?\s*status\b""",
+    re.IGNORECASE,
+)
+
+
+def is_status_phrase(text: Optional[str]) -> bool:
+    if not text or not isinstance(text, str):
+        return False
+    return STATUS_PHRASE_RE.match(text) is not None
+
+
+# In-memory denied-inbound counter (resets on gateway restart).
+_denied_lock = threading.Lock()
+_denied_count = 0
+# Track previous lock state across calls so we can emit a one-shot
+# "lockdown cleared" audit event the first time we observe the flag gone.
+_last_seen_locked = False
+
+
+def _bump_denied() -> int:
+    global _denied_count
+    with _denied_lock:
+        _denied_count += 1
+        return _denied_count
+
+
+def get_denied_count() -> int:
+    with _denied_lock:
+        return _denied_count
+
+
+def lockdown_since() -> Optional[str]:
+    """Return the ISO timestamp the active lockdown was engaged, if any."""
+    p = lockdown_flag_path()
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        ts = data.get("ts")
+        if ts:
+            return str(ts)
+    except Exception:
+        pass
+    try:
+        return datetime.fromtimestamp(p.stat().st_mtime, tz=timezone.utc).isoformat()
+    except Exception:
+        return None
+
+
+def status_summary() -> str:
+    if is_locked():
+        ts = lockdown_since() or "?"
+        return f"🔒 Locked since {ts}. Recent denied count: {get_denied_count()}."
+    return "🟢 Atlas open. No active lockdown."
+
+
+def audit_blocked_inbound(
+    *,
+    channel: Optional[str],
+    sender: Optional[str],
+    message: Optional[str],
+    reason: str = "lockdown_active",
+) -> None:
+    """Record an inbound message that was refused because Atlas is locked."""
+    _bump_denied()
+    record = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "event_type": "inbound_blocked",
+        "channel": channel,
+        "sender": sender,
+        "reason": reason,
+        "was_during_lockdown": True,
+        "message_preview": _truncate(message or "", 200),
+    }
+    try:
+        _atomic_append(_audit_path_for_today(), json.dumps(record, ensure_ascii=False, default=str))
+    except Exception as e:
+        logger.error("audit_blocked_inbound write failed: %s", e)
+
+
+# --------------------------------------------------------------------------
+# Gateway hard-seal hook.
+#
+# When ~/.atlas/state/lockdown.flag exists, EVERY inbound message on every
+# platform is intercepted before the LLM agent loop can see it. The gateway
+# replies with a Jarvis-style canned notice (rate-limited per chat) or, for
+# the two authorized sentinel phrases (`atlas: status` / `atlas: lockdown`),
+# returns a pure-code response. Nothing else works.
+# --------------------------------------------------------------------------
+
+LOCKED_ALREADY_REPLY = "Already locked. Status via `atlas: status`."
+
+_RATE_LIMIT_SECONDS = 60
+_chat_reply_lock = threading.Lock()
+_chat_last_reply_at: Dict[str, float] = {}
+
+
+def _rate_limit_allow(chat_id: str) -> bool:
+    """Return True if the canned lockdown reply may be sent to this chat now."""
+    key = chat_id or "unknown"
+    now = time.monotonic()
+    with _chat_reply_lock:
+        last = _chat_last_reply_at.get(key, 0.0)
+        if now - last < _RATE_LIMIT_SECONDS:
+            return False
+        _chat_last_reply_at[key] = now
+        return True
+
+
+def _reset_rate_limits() -> None:
+    with _chat_reply_lock:
+        _chat_last_reply_at.clear()
+
+
+def _scan_today_for_blocked() -> Tuple[int, Optional[str]]:
+    """Count inbound_blocked events in today's audit log; return (count, last_ts)."""
+    p = _audit_path_for_today()
+    if not p.exists():
+        return 0, None
+    n = 0
+    last_ts: Optional[str] = None
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except Exception:
+                    continue
+                if rec.get("event_type") == "inbound_blocked":
+                    n += 1
+                    last_ts = rec.get("ts") or last_ts
+    except Exception:
+        pass
+    return n, last_ts
+
+
+def status_line() -> str:
+    """Pure-code status response for the `atlas: status` sentinel."""
+    if is_locked():
+        ts = lockdown_since() or "?"
+        n, last = _scan_today_for_blocked()
+        return f"🔒 Locked since {ts}. Inbound blocked: {n}. Last attempt: {last or 'n/a'}."
+    return "🟢 Atlas open. No active lockdown."
+
+
+_last_seen_locked_since: Optional[str] = None
+
+
+def note_lockdown_state_transition() -> None:
+    """Track lock-state transitions; emit lockdown_cleared event on unlock."""
+    global _last_seen_locked, _last_seen_locked_since, _denied_count
+    locked_now = is_locked()
+    if locked_now and not _last_seen_locked:
+        _last_seen_locked_since = lockdown_since()
+    if _last_seen_locked and not locked_now:
+        n, last = _scan_today_for_blocked()
+        started = _last_seen_locked_since
+        duration_s: Optional[float] = None
+        try:
+            if started:
+                t0 = datetime.fromisoformat(started.replace("Z", "+00:00"))
+                duration_s = (datetime.now(timezone.utc) - t0).total_seconds()
+        except Exception:
+            duration_s = None
+        payload = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "locked_since": started,
+            "duration_seconds": duration_s,
+            "blocked_inbounds": n,
+            "last_blocked_attempt": last,
+        }
+        try:
+            audit_event(event_type="lockdown_cleared", channel=None, payload=payload)
+        except Exception:
+            pass
+        try:
+            p = incidents_path()
+            p.parent.mkdir(parents=True, exist_ok=True)
+            ts = payload["ts"]
+            dur = f"{duration_s:.0f}s" if duration_s is not None else "?"
+            _atomic_append(
+                p,
+                f"\n## {ts} — lockdown cleared\n"
+                f"- **locked_since**: `{started}`\n"
+                f"- **duration**: {dur}\n"
+                f"- **blocked_inbounds**: {n}\n"
+                f"- **last_blocked_attempt**: `{last}`\n",
+            )
+        except Exception:
+            pass
+        with _denied_lock:
+            _denied_count = 0
+        _last_seen_locked_since = None
+        _reset_rate_limits()
+    _last_seen_locked = locked_now
+
+
+def gateway_intercept(
+    *,
+    channel: Optional[str],
+    text: Optional[str],
+    sender: Optional[str],
+    chat_id: Optional[str],
+    is_authorized: bool,
+) -> Dict[str, Any]:
+    """Single hard-seal hook called by the gateway BEFORE auth + agent loop.
+
+    Returns ``{"action": "pass"|"block"|"trigger", "reply": Optional[str]}``.
+
+    * ``pass`` — caller continues normal dispatch.
+    * ``block`` — caller MUST NOT invoke the agent loop. If ``reply`` is set,
+      caller sends it back on the originating channel.
+    * ``trigger`` — caller engages lockdown then sends ``reply``.
+    """
+    note_lockdown_state_transition()
+    msg = text or ""
+    is_panic = is_panic_phrase(msg)
+    is_status = is_status_phrase(msg)
+    locked = is_locked()
+
+    if locked:
+        # Always audit. Reason tags help post-incident review.
+        if is_status:
+            reason = "status_sentinel"
+        elif is_panic:
+            reason = "panic_phrase_idempotent"
+        else:
+            reason = "lockdown_active"
+        try:
+            audit_blocked_inbound(channel=channel, sender=sender, message=msg, reason=reason)
+        except Exception:
+            pass
+        if is_status:
+            return {"action": "block", "reply": status_line()}
+        if is_panic:
+            return {"action": "block", "reply": LOCKED_ALREADY_REPLY}
+        # Generic inbound — canned reply, rate-limited per chat.
+        if _rate_limit_allow(chat_id or sender or "unknown"):
+            return {"action": "block", "reply": LOCKDOWN_REPLY}
+        return {"action": "block", "reply": None}
+
+    # Not locked.
+    if is_panic:
+        if is_authorized:
+            return {"action": "trigger", "reply": LOCKDOWN_REPLY}
+        # Unauthorized panic-phrase attempt: audit, drop silently.
+        try:
+            audit_event(
+                event_type="unauthorized_panic_attempt",
+                channel=channel,
+                payload={"sender": sender, "preview": _truncate(msg, 200)},
+            )
+        except Exception:
+            pass
+        return {"action": "block", "reply": None}
+    return {"action": "pass", "reply": None}

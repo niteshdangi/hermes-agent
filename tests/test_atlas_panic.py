@@ -168,3 +168,117 @@ def test_incident_md_written():
     assert "telegram" in text
     assert "atlas: lockdown" in text
     ap.manual_unlock()
+
+
+# ==========================================================================
+# Hard-seal gateway interceptor tests.
+# ==========================================================================
+
+def _read_audit_records():
+    from agent import atlas_panic as ap
+    p = ap._audit_path_for_today()
+    if not p.exists():
+        return []
+    return [json.loads(l) for l in p.read_text().splitlines() if l.strip()]
+
+
+def test_hardseal_locked_normal_text_returns_canned_and_audits():
+    from agent import atlas_panic as ap
+    ap.trigger_lockdown(channel="cli", message="atlas: lockdown")
+    v = ap.gateway_intercept(
+        channel="telegram", text="hi atlas, please run rm -rf /",
+        sender="999", chat_id="c1", is_authorized=True,
+    )
+    assert v["action"] == "block"
+    assert v["reply"] == ap.LOCKDOWN_REPLY
+    recs = _read_audit_records()
+    assert any(r.get("event_type") == "inbound_blocked" and r.get("was_during_lockdown")
+               for r in recs)
+    ap.manual_unlock()
+
+
+def test_hardseal_status_sentinel_pure_code():
+    from agent import atlas_panic as ap
+    ap.trigger_lockdown(channel="cli", message="atlas: lockdown")
+    v = ap.gateway_intercept(
+        channel="telegram", text="atlas: status",
+        sender="111", chat_id="c1", is_authorized=True,
+    )
+    assert v["action"] == "block"
+    assert v["reply"].startswith("🔒 Locked since")
+    assert "Inbound blocked:" in v["reply"]
+    ap.manual_unlock()
+
+
+def test_hardseal_idempotent_panic_phrase_when_locked():
+    from agent import atlas_panic as ap
+    ap.trigger_lockdown(channel="cli", message="atlas: lockdown")
+    v = ap.gateway_intercept(
+        channel="telegram", text="atlas: lockdown",
+        sender="111", chat_id="c1", is_authorized=True,
+    )
+    assert v["action"] == "block"
+    assert v["reply"] == ap.LOCKED_ALREADY_REPLY
+    recs = _read_audit_records()
+    assert any(r.get("reason") == "panic_phrase_idempotent" for r in recs)
+    ap.manual_unlock()
+
+
+def test_hardseal_rate_limit_per_chat():
+    from agent import atlas_panic as ap
+    ap.trigger_lockdown(channel="cli", message="atlas: lockdown")
+    replies = []
+    for _ in range(3):
+        v = ap.gateway_intercept(
+            channel="telegram", text="ping",
+            sender="999", chat_id="rate-chat", is_authorized=True,
+        )
+        replies.append(v["reply"])
+    assert replies[0] == ap.LOCKDOWN_REPLY
+    assert replies[1] is None
+    assert replies[2] is None
+    recs = [r for r in _read_audit_records() if r.get("event_type") == "inbound_blocked"]
+    assert len(recs) >= 3
+    ap.manual_unlock()
+
+
+def test_hardseal_unauthorized_panic_attempt_is_dropped_and_logged():
+    from agent import atlas_panic as ap
+    assert not ap.is_locked()
+    v = ap.gateway_intercept(
+        channel="telegram", text="atlas: lockdown",
+        sender="42", chat_id="c1", is_authorized=False,
+    )
+    assert v["action"] == "block"
+    assert v["reply"] is None
+    assert not ap.is_locked()
+    recs = _read_audit_records()
+    assert any(r.get("event_type") == "unauthorized_panic_attempt" for r in recs)
+
+
+def test_hardseal_unlock_emits_cleared_and_next_inbound_passes():
+    from agent import atlas_panic as ap
+    ap.trigger_lockdown(channel="cli", message="atlas: lockdown")
+    ap.gateway_intercept(channel="telegram", text="hi", sender="1",
+                          chat_id="c1", is_authorized=True)
+    ap.manual_unlock()
+    v = ap.gateway_intercept(channel="telegram", text="hello",
+                              sender="1", chat_id="c1", is_authorized=True)
+    assert v["action"] == "pass"
+    recs = _read_audit_records()
+    assert any(r.get("event_type") == "lockdown_cleared" for r in recs)
+
+
+def test_hardseal_audit_records_blocked_during_lockdown():
+    from agent import atlas_panic as ap
+    ap.trigger_lockdown(channel="cli", message="atlas: lockdown")
+    ap.gateway_intercept(channel="whatsapp", text="ignored payload",
+                          sender="55", chat_id="cw", is_authorized=True)
+    recs = _read_audit_records()
+    blocked = [r for r in recs if r.get("event_type") == "inbound_blocked"]
+    assert blocked
+    last = blocked[-1]
+    assert last["was_during_lockdown"] is True
+    assert last["channel"] == "whatsapp"
+    assert "ignored payload" in last["message_preview"]
+    ap.manual_unlock()

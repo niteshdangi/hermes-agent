@@ -3635,6 +3635,69 @@ class GatewayRunner:
                 if _action == "allow":
                     break
 
+        # ──────────────────────────────────────────────────────────────────
+        # Atlas hard-seal interceptor.
+        # Runs BEFORE authorization + agent loop. When ~/.atlas/state/
+        # lockdown.flag exists, NO inbound message reaches the LLM. Only
+        # `atlas: status` and `atlas: lockdown` sentinel phrases get a
+        # pure-code reply; everything else gets a rate-limited canned notice.
+        # ──────────────────────────────────────────────────────────────────
+        if not is_internal:
+            try:
+                from agent import atlas_panic as _atlas_panic  # type: ignore
+                _channel = source.platform.value if source.platform else "unknown"
+                _text = event.text or ""
+                # Cheap recent-message ring buffer (used for incident summary).
+                try:
+                    _atlas_panic.record_recent_message(_channel, _text)
+                except Exception:
+                    pass
+                try:
+                    _is_auth = bool(source.user_id is not None and self._is_user_authorized(source))
+                except Exception:
+                    _is_auth = False
+                _verdict = _atlas_panic.gateway_intercept(
+                    channel=_channel,
+                    text=_text,
+                    sender=str(source.user_id) if source.user_id else None,
+                    chat_id=str(source.chat_id) if source.chat_id else None,
+                    is_authorized=_is_auth,
+                )
+                _action = _verdict.get("action")
+                _reply = _verdict.get("reply")
+                if _action == "trigger":
+                    # Authorized panic phrase, not yet locked → engage now.
+                    try:
+                        _recent = _atlas_panic.get_recent_messages(_channel)
+                        _atlas_panic.trigger_lockdown(
+                            channel=_channel,
+                            message=_text,
+                            source_user=str(source.user_id) if source.user_id else None,
+                            source_ip=getattr(event, "source_ip", None),
+                            recent_messages=_recent,
+                        )
+                    except Exception as _e:
+                        logger.error("trigger_lockdown failed: %s", _e)
+                    adapter = self.adapters.get(source.platform)
+                    if adapter and _reply:
+                        try:
+                            await adapter.send(source.chat_id, _reply)
+                        except Exception as _e:
+                            logger.error("lockdown reply failed: %s", _e)
+                    return None
+                if _action == "block":
+                    if _reply:
+                        adapter = self.adapters.get(source.platform)
+                        if adapter:
+                            try:
+                                await adapter.send(source.chat_id, _reply)
+                            except Exception as _e:
+                                logger.error("lockdown reply failed: %s", _e)
+                    return None
+                # action == "pass" → continue normal dispatch.
+            except Exception as _e:
+                logger.error("atlas hard-seal interceptor failed: %s", _e)
+
         if is_internal:
             pass
         elif source.user_id is None:
@@ -3679,37 +3742,8 @@ class GatewayRunner:
                     self.pairing_store._record_rate_limit(platform_name, source.user_id)
             return None
 
-        # ──────────────────────────────────────────────────────────────────
-        # Atlas panic-phrase interceptor.
-        # Runs BEFORE any agent logic so a compromised LLM context can't
-        # talk Atlas out of locking down. Authorized-user check above already
-        # passed; we still record the source for incident review.
-        # ──────────────────────────────────────────────────────────────────
-        if not is_internal:
-            try:
-                from agent import atlas_panic as _atlas_panic  # type: ignore
-                _text = event.text or ""
-                _channel = source.platform.value if source.platform else "unknown"
-                _atlas_panic.record_recent_message(_channel, _text)
-                if _atlas_panic.is_panic_phrase(_text):
-                    recent = _atlas_panic.get_recent_messages(_channel)
-                    _atlas_panic.trigger_lockdown(
-                        channel=_channel,
-                        message=_text,
-                        source_user=str(source.user_id) if source.user_id else None,
-                        source_ip=getattr(event, "source_ip", None),
-                        recent_messages=recent,
-                    )
-                    adapter = self.adapters.get(source.platform)
-                    if adapter:
-                        try:
-                            await adapter.send(source.chat_id, _atlas_panic.LOCKDOWN_REPLY)
-                        except Exception as _e:
-                            logger.error("lockdown reply failed: %s", _e)
-                    return None
-            except Exception as _e:
-                logger.error("panic-phrase interceptor failed: %s", _e)
-        
+
+
         # Intercept messages that are responses to a pending /update prompt.
         # The update process (detached) wrote .update_prompt.json; the watcher
         # forwarded it to the user; now the user's reply goes back via
